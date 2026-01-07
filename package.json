@@ -1,0 +1,31 @@
+{
+  "name": "deputy",
+  "version": "1.0.0",
+  "description": "Autonomous executive assistant agent that continuously works with your supervision",
+  "type": "module",
+  "main": "dist/index.js",
+  "scripts": {
+    "start": "NODE_NO_WARNINGS=1 node dist/index.js",
+    "dev": "tsc --watch & node --watch dist/index.js",
+    "build": "tsc",
+    "typecheck": "tsc --noEmit"
+  },
+  "keywords": [
+    "agent",
+    "ai",
+    "assistant",
+    "claude",
+    "autonomous"
+  ],
+  "author": "",
+  "license": "MIT",
+  "dependencies": {
+    "@anthropic-ai/claude-agent-sdk": "^0.1.76",
+    "dotenv": "^17.2.3",
+    "zod": "^4.2.1"
+  },
+  "devDependencies": {
+    "@types/node": "^25.0.3",
+    "typescript": "^5.9.3"
+  }
+}
