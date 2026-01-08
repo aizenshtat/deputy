@@ -1570,6 +1570,10 @@ ${domainList}
     return { ...this.state };
   }
 
+  getCurrentTaskId(): string | undefined {
+    return this.state.currentTaskId;
+  }
+
   private sleep(ms: number): Promise<void> {
     return new Promise((resolve) => {
       const timeout = setTimeout(resolve, ms);

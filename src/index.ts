@@ -211,6 +211,52 @@ async function main(): Promise<void> {
     prompt: `${colors.success('❯')} ${colors.bold('You:')} `,
   });
 
+  // Track the last injected task ID to avoid duplicates
+  let lastInjectedTaskId: string | undefined;
+
+  // Function to update history with current task
+  const updateCurrentTaskInHistory = () => {
+    const currentTaskId = deputy.getCurrentTaskId();
+
+    // Remove old injected command if task changed or completed
+    if (lastInjectedTaskId && lastInjectedTaskId !== currentTaskId) {
+      const oldCommand = `/tasks show ${lastInjectedTaskId.slice(0, 8)}`;
+      const historyArray = (rl as any).history;
+      const index = historyArray.indexOf(oldCommand);
+      if (index !== -1) {
+        historyArray.splice(index, 1);
+      }
+    }
+
+    // Inject new current task command at front of history
+    if (currentTaskId && currentTaskId !== lastInjectedTaskId) {
+      const taskShowCommand = `/tasks show ${currentTaskId.slice(0, 8)}`;
+      const historyArray = (rl as any).history;
+
+      // Remove if it exists elsewhere in history
+      const existingIndex = historyArray.indexOf(taskShowCommand);
+      if (existingIndex !== -1) {
+        historyArray.splice(existingIndex, 1);
+      }
+
+      // Add to front
+      historyArray.unshift(taskShowCommand);
+      lastInjectedTaskId = currentTaskId;
+    } else if (!currentTaskId && lastInjectedTaskId) {
+      // Task completed, remove the injected command
+      const oldCommand = `/tasks show ${lastInjectedTaskId.slice(0, 8)}`;
+      const historyArray = (rl as any).history;
+      const index = historyArray.indexOf(oldCommand);
+      if (index !== -1) {
+        historyArray.splice(index, 1);
+      }
+      lastInjectedTaskId = undefined;
+    }
+  };
+
+  // Update history periodically to track current task
+  setInterval(updateCurrentTaskInHistory, 1000);
+
   // Show initial prompt
   rl.prompt();
 
