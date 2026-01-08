@@ -6,6 +6,13 @@ export type TaskPriority = 'critical' | 'high' | 'medium' | 'low';
 export type TaskStatus = 'pending' | 'in_progress' | 'waiting_approval' | 'approved' | 'completed' | 'failed' | 'cancelled';
 export type ApprovalStatus = 'pending' | 'approved' | 'rejected';
 
+export interface TaskLog {
+  timestamp: Date;
+  type: 'info' | 'tool_use' | 'tool_result' | 'thinking' | 'error';
+  message: string;
+  details?: Record<string, unknown>;
+}
+
 export interface Task {
   id: string;
   title: string;
@@ -24,6 +31,7 @@ export interface Task {
   error?: string;
   approvalId?: string;
   tags: string[];
+  logs: TaskLog[];
 }
 
 export interface Goal {

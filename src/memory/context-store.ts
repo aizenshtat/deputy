@@ -88,6 +88,49 @@ export class ContextStore {
   }
 
   /**
+   * Get entry by ID
+   */
+  getById(id: string): ContextEntry | undefined {
+    return this.entries.get(id);
+  }
+
+  /**
+   * Delete entry by ID
+   */
+  delete(id: string): boolean {
+    const deleted = this.entries.delete(id);
+    if (deleted) this.notifyChange();
+    return deleted;
+  }
+
+  /**
+   * Delete entry by category and key
+   */
+  deleteByKey(category: ContextEntry['category'], key: string): boolean {
+    const entry = this.findByKey(category, key);
+    if (entry) {
+      return this.delete(entry.id);
+    }
+    return false;
+  }
+
+  /**
+   * Update entry value
+   */
+  update(id: string, updates: Partial<Pick<ContextEntry, 'value' | 'confidence' | 'tags'>>): boolean {
+    const entry = this.entries.get(id);
+    if (!entry) return false;
+
+    if (updates.value !== undefined) entry.value = updates.value;
+    if (updates.confidence !== undefined) entry.confidence = updates.confidence;
+    if (updates.tags !== undefined) entry.tags = updates.tags;
+    entry.updatedAt = new Date();
+
+    this.notifyChange();
+    return true;
+  }
+
+  /**
    * Build context summary for a specific domain
    */
   buildContextSummary(categories?: ContextEntry['category'][]): string {

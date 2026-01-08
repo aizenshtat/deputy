@@ -49,12 +49,8 @@ export class AuditLog {
       if ('tool_name' in input) {
         const toolInput = 'tool_input' in input ? input.tool_input : undefined;
 
-        // Real-time console output
-        console.log(`  [TOOL] ${input.tool_name}`);
-        if (toolInput && typeof toolInput === 'object') {
-          const summary = this.summarizeInput(toolInput);
-          if (summary) console.log(`         ${summary}`);
-        }
+        // Console output now handled by rolling window in executeTask()
+        // Audit logs are still written to disk below
 
         await this.log({
           event: 'PreToolUse',

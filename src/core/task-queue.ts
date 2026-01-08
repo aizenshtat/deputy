@@ -15,9 +15,14 @@ const PRIORITY_ORDER: Record<TaskPriority, number> = {
 export class TaskQueue {
   private tasks: Map<string, Task> = new Map();
   private onChangeCallbacks: Array<() => void> = [];
+  private onFailureCallbacks: Array<(task: Task) => void> = [];
 
   constructor(initialTasks: Task[] = []) {
     for (const task of initialTasks) {
+      // Ensure logs field exists for backwards compatibility
+      if (!task.logs) {
+        task.logs = [];
+      }
       this.tasks.set(task.id, task);
     }
   }
@@ -48,11 +53,26 @@ export class TaskQueue {
       parentTaskId: params.parentTaskId,
       context: params.context ?? {},
       tags: params.tags ?? [],
+      logs: [],
     };
 
     this.tasks.set(task.id, task);
     this.notifyChange();
     return task;
+  }
+
+  /**
+   * Add a log entry to a task
+   */
+  addTaskLog(taskId: string, log: { type: 'info' | 'tool_use' | 'tool_result' | 'thinking' | 'error'; message: string; details?: Record<string, unknown> }): void {
+    const task = this.tasks.get(taskId);
+    if (task) {
+      task.logs.push({
+        timestamp: new Date(),
+        ...log,
+      });
+      this.notifyChange();
+    }
   }
 
   /**
@@ -88,10 +108,18 @@ export class TaskQueue {
     const task = this.tasks.get(taskId);
     if (!task) return undefined;
 
+    const wasNotFailed = task.status !== 'failed';
     task.status = status;
     task.updatedAt = new Date();
     if (result) task.result = result;
     if (error) task.error = error;
+
+    // Notify failure callbacks if transitioning to failed state
+    if (status === 'failed' && wasNotFailed) {
+      for (const cb of this.onFailureCallbacks) {
+        cb(task);
+      }
+    }
 
     this.notifyChange();
     return task;
@@ -163,6 +191,15 @@ export class TaskQueue {
   }
 
   /**
+   * Delete a task by ID
+   */
+  deleteTask(taskId: string): boolean {
+    const deleted = this.tasks.delete(taskId);
+    if (deleted) this.notifyChange();
+    return deleted;
+  }
+
+  /**
    * Get queue statistics
    */
   getStats(): {
@@ -192,6 +229,17 @@ export class TaskQueue {
     return () => {
       const index = this.onChangeCallbacks.indexOf(callback);
       if (index >= 0) this.onChangeCallbacks.splice(index, 1);
+    };
+  }
+
+  /**
+   * Subscribe to task failures
+   */
+  onFailure(callback: (task: Task) => void): () => void {
+    this.onFailureCallbacks.push(callback);
+    return () => {
+      const index = this.onFailureCallbacks.indexOf(callback);
+      if (index >= 0) this.onFailureCallbacks.splice(index, 1);
     };
   }
 

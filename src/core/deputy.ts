@@ -17,13 +17,14 @@ import { ChatHandler } from './chat-handler.js';
 import { AutonomousScanner } from './autonomous-scanner.js';
 import { ContextStore } from '../memory/context-store.js';
 import { GoalManager } from '../memory/goals.js';
-import { ResponsibilityManager } from '../memory/responsibilities.js';
+import { ResponsibilityManager, Responsibility } from '../memory/responsibilities.js';
 import { Persistence, PersistedData } from '../memory/persistence.js';
 import { AuditLog } from '../hooks/audit-log.js';
 import { SupervisionHook } from '../hooks/supervision.js';
 import { getAgentDefinitions } from '../agents/index.js';
 import { buildSystemPrompt, buildTaskPrompt } from '../config/system-prompt.js';
-import { DeputyState, DeputyConfig, Task } from '../types.js';
+import { DeputyState, DeputyConfig, Task, ContextEntry } from '../types.js';
+import { colors, statusSymbols, renderMarkdown } from '../utils/colors.js';
 
 const DEFAULT_CONFIG: DeputyConfig = {
   workingDirectory: process.cwd(),
@@ -86,6 +87,13 @@ export class Deputy {
       taskQueue: this.taskQueue,
       contextStore: this.contextStore,
       goalManager: this.goalManager,
+      creationCallbacks: {
+        createGoal: (params) => this.createGoalFromParams(params),
+        createResponsibility: (params) => this.createResponsibilityFromParams(params),
+        createTask: (params) => this.createTaskFromParams(params),
+        storeContext: (params) => this.storeContextFromParams(params),
+      },
+      mcpServerFactory: () => this.createDeputyTools(),
       scanIntervalMs: 30 * 60 * 1000, // 30 minutes
       model: this.config.model,
       cwd: this.config.workingDirectory,
@@ -115,8 +123,19 @@ export class Deputy {
       this.responsibilityManager = new ResponsibilityManager(data.responsibilities ?? []);
       this.state = data.state;
 
-      // Restore session ID for conversation continuity
+      // Reset isRunning flag - should always start as false when loading from disk
+      this.state.isRunning = false;
+
+      // Restore session ID for conversation continuity (enables task resumption)
       this.currentSessionId = data.state.sessionId;
+
+      // Report if there's a task to resume
+      if (this.state.currentTaskId) {
+        const task = this.taskQueue.getTask(this.state.currentTaskId);
+        if (task && task.status === 'in_progress') {
+          console.log(colors.info(`\n⏯️  Resuming task from previous session: ${colors.bold(task.title)} (${task.id.slice(0, 8)})\n`));
+        }
+      }
 
       // Re-attach change listeners
       this.taskQueue.onChange(() => this.saveState());
@@ -124,6 +143,16 @@ export class Deputy {
       this.contextStore.onChange(() => this.saveState());
       this.goalManager.onChange(() => this.saveState());
       this.responsibilityManager.onChange(() => this.saveState());
+
+      // Subscribe to task failures for notifications
+      this.taskQueue.onFailure((task) => {
+        console.log(colors.error(`\n${statusSymbols.error} TASK FAILED: ${task.title}`));
+        console.log(colors.dim(`   ID: ${task.id.slice(0, 8)}`));
+        if (task.error) {
+          console.log(colors.error(`   Error: ${task.error.slice(0, 200)}`));
+        }
+        console.log(colors.info(`   Use /tasks to see all tasks\n`));
+      });
 
       // Re-create supervision hook with restored queues
       this.supervisionHook = new SupervisionHook(this.approvalQueue, this.taskQueue);
@@ -134,6 +163,13 @@ export class Deputy {
         taskQueue: this.taskQueue,
         contextStore: this.contextStore,
         goalManager: this.goalManager,
+        creationCallbacks: {
+          createGoal: (params) => this.createGoalFromParams(params),
+          createResponsibility: (params) => this.createResponsibilityFromParams(params),
+          createTask: (params) => this.createTaskFromParams(params),
+          storeContext: (params) => this.storeContextFromParams(params),
+        },
+        mcpServerFactory: () => this.createDeputyTools(),
         scanIntervalMs: 30 * 60 * 1000,
         model: this.config.model,
         cwd: this.config.workingDirectory,
@@ -163,13 +199,28 @@ export class Deputy {
   }
 
   /**
-   * Stop the agent
+   * Stop the agent gracefully
    */
-  stop(): void {
+  async stop(): Promise<void> {
     this.state.isRunning = false;
     this.loopAbortController?.abort();
     this.loopAbortController = null;
-    console.log('Deputy stopped');
+
+    // Add shutdown log to current task if one is running (will resume on restart)
+    if (this.state.currentTaskId) {
+      const task = this.taskQueue.getTask(this.state.currentTaskId);
+      if (task && task.status === 'in_progress') {
+        this.taskQueue.addTaskLog(this.state.currentTaskId, {
+          type: 'info',
+          message: 'System shutdown - task will resume on next startup'
+        });
+        console.log(colors.dim(`\n  Task "${task.title}" will resume when Deputy restarts\n`));
+      }
+    }
+
+    // Save final state (preserves in_progress status for resumption)
+    await this.saveState();
+    console.log('Deputy stopped gracefully');
   }
 
   /**
@@ -177,44 +228,84 @@ export class Deputy {
    */
   private async runLoop(): Promise<void> {
     let idleLogged = false;
+    let idleCycles = 0;
+    const IDLE_HEARTBEAT_CYCLES = 12; // Every ~60s with 5s polling (or ~120s with 10s)
 
     while (this.state.isRunning) {
       try {
-        // Check for workable tasks
-        const nextTask = this.taskQueue.getNextTask();
+        // Priority 1: Resume in-progress task if one exists
+        let taskToExecute: Task | undefined;
+        if (this.state.currentTaskId) {
+          const currentTask = this.taskQueue.getTask(this.state.currentTaskId);
+          if (currentTask && currentTask.status === 'in_progress') {
+            taskToExecute = currentTask;
+          }
+        }
 
-        if (nextTask) {
-          idleLogged = false;
-          await this.executeTask(nextTask);
-        } else {
-          // No tasks available, check for approved tasks
+        // Priority 2: Check for new pending tasks
+        if (!taskToExecute) {
+          taskToExecute = this.taskQueue.getNextTask();
+        }
+
+        // Priority 3: Check for approved tasks
+        if (!taskToExecute) {
           const approvedTasks = this.taskQueue.getTasksByStatus('approved');
           if (approvedTasks.length > 0) {
-            idleLogged = false;
-            await this.executeTask(approvedTasks[0]);
-          } else {
+            taskToExecute = approvedTasks[0];
+          }
+        }
+
+        if (taskToExecute) {
+          idleLogged = false;
+          idleCycles = 0;
+          await this.executeTask(taskToExecute);
+        } else {
             // Idle - run autonomous scanner if it's time
             if (this.autonomousScanner.shouldScan()) {
               idleLogged = false;
+              idleCycles = 0;
               await this.autonomousScanner.scan();
-            } else if (!idleLogged) {
-              const stats = this.taskQueue.getStats();
-              const approvals = this.approvalQueue.getStats();
-              const respStats = this.responsibilityManager.getStats();
-              const nextScan = this.autonomousScanner.getNextScanTime();
-              const minsToScan = Math.round((nextScan.getTime() - Date.now()) / 60000);
+            } else {
+              idleCycles++;
 
-              if (stats.waitingApproval > 0 || approvals.pending > 0) {
-                console.log(`[IDLE] Waiting for ${approvals.pending} approval(s). Use /approvals to review.`);
-              } else if (respStats.active > 0) {
-                console.log(`[IDLE] Monitoring ${respStats.active} responsibility(ies). Next scan in ${minsToScan}m.`);
-              } else {
-                console.log('[IDLE] No tasks or responsibilities. Use /responsibility to add ongoing work.');
+              // First idle message
+              if (!idleLogged) {
+                const stats = this.taskQueue.getStats();
+                const approvals = this.approvalQueue.getStats();
+                const respStats = this.responsibilityManager.getStats();
+                const nextScan = this.autonomousScanner.getNextScanTime();
+                const minsToScan = Math.max(0, Math.round((nextScan.getTime() - Date.now()) / 60000));
+
+                if (stats.waitingApproval > 0 || approvals.pending > 0) {
+                  console.log(
+                    colors.warning(
+                      `\n${statusSymbols.warning} [IDLE] Waiting for ${colors.bold(approvals.pending.toString())} approval(s). Use ${colors.info('/approvals')} to review.\n`
+                    )
+                  );
+                } else if (respStats.active > 0) {
+                  console.log(
+                    colors.info(
+                      `\n${statusSymbols.info} [IDLE] Monitoring ${colors.bold(respStats.active.toString())} responsibility(ies). Next scan in ${colors.bold(minsToScan + 'm')}.\n`
+                    )
+                  );
+                } else {
+                  console.log(
+                    colors.dim(
+                      `\n${statusSymbols.pending} [IDLE] No tasks or responsibilities. Use ${colors.info('/responsibility')} to add ongoing work.\n`
+                    )
+                  );
+                }
+                idleLogged = true;
               }
-              idleLogged = true;
+
+              // Periodic heartbeat
+              if (idleCycles % IDLE_HEARTBEAT_CYCLES === 0) {
+                const nextScan = this.autonomousScanner.getNextScanTime();
+                const minsToScan = Math.max(0, Math.round((nextScan.getTime() - Date.now()) / 60000));
+                console.log(colors.dim(`[${new Date().toLocaleTimeString()}] Still monitoring... Next scan in ${minsToScan}m`));
+              }
             }
           }
-        }
 
         // Update stats
         this.updateStats();
@@ -222,7 +313,7 @@ export class Deputy {
         // Wait before next iteration
         await this.sleep(this.config.pollingIntervalMs);
       } catch (error) {
-        console.error('Error in main loop:', error);
+        console.error(colors.error('Error in main loop:'), error);
         await this.sleep(this.config.pollingIntervalMs);
       }
     }
@@ -232,11 +323,42 @@ export class Deputy {
    * Execute a single task
    */
   private async executeTask(task: Task): Promise<void> {
-    console.log(`Executing task: ${task.title}`);
+    const isResuming = task.status === 'in_progress';
 
-    this.taskQueue.updateTaskStatus(task.id, 'in_progress');
+    if (isResuming) {
+      console.log(colors.inProgress(`\n${statusSymbols.inProgress} Resuming task: ${colors.bold(task.title)}`));
+    } else {
+      console.log(colors.inProgress(`\n${statusSymbols.inProgress} Executing task: ${colors.bold(task.title)}`));
+      this.taskQueue.updateTaskStatus(task.id, 'in_progress');
+    }
+
     this.supervisionHook.setCurrentTask(task.id);
     this.state.currentTaskId = task.id;
+
+    // Periodic status updates (non-intrusive)
+    const taskStartTime = Date.now();
+    let lastToolUsed = '';
+    let lastThinking = '';
+    let lastText = '';
+    let statusInterval: NodeJS.Timeout | null = null;
+
+    const showPeriodicStatus = () => {
+      const elapsed = Math.floor((Date.now() - taskStartTime) / 1000);
+      const mins = Math.floor(elapsed / 60);
+      const secs = elapsed % 60;
+      const timeStr = mins > 0 ? `${mins}m ${secs}s` : `${secs}s`;
+
+      let status = colors.dim(`  ⚙️ ${task.title.slice(0, 40)}${task.title.length > 40 ? '...' : ''}`);
+      if (lastToolUsed) {
+        status += colors.dim(` | Last: ${lastToolUsed}`);
+      }
+      status += colors.dim(` | ${timeStr} elapsed`);
+
+      console.log(status);
+    };
+
+    // Start periodic status updates every 20 seconds
+    statusInterval = setInterval(showPeriodicStatus, 20000);
 
     try {
       const systemPrompt = buildSystemPrompt({
@@ -281,17 +403,100 @@ export class Deputy {
           this.currentSessionId = message.session_id;
           this.state.sessionId = message.session_id;
           this.saveState();
+          this.taskQueue.addTaskLog(task.id, {
+            type: 'info',
+            message: isResuming ? 'Resuming task from previous session' : 'Task execution started'
+          });
+        }
+
+        // Handle assistant messages (SDK format: message.message contains the actual API message)
+        if (message.type === 'assistant' && 'message' in message) {
+          const apiMessage = message.message as any;
+
+          // Process content blocks in the API message
+          if (apiMessage.content && Array.isArray(apiMessage.content)) {
+            for (const block of apiMessage.content) {
+              // Text content
+              if (block.type === 'text' && block.text) {
+                const textContent = block.text;
+                if (textContent.trim()) {
+                  lastText = textContent.slice(0, 80);
+                  this.taskQueue.addTaskLog(task.id, {
+                    type: 'info',
+                    message: `Agent: ${textContent.slice(0, 200)}`
+                  });
+                }
+              }
+
+              // Thinking blocks
+              if (block.type === 'thinking' && block.thinking) {
+                const thinking = block.thinking;
+                if (thinking.trim()) {
+                  lastThinking = thinking.slice(0, 80);
+                  this.taskQueue.addTaskLog(task.id, {
+                    type: 'thinking',
+                    message: thinking.slice(0, 200)
+                  });
+                }
+              }
+
+              // Tool use
+              if (block.type === 'tool_use' && block.name) {
+                const toolName = block.name;
+                // Shorten MCP tool names for display
+                const displayName = toolName.startsWith('mcp__')
+                  ? toolName.replace('mcp__chrome-devtools__', 'chrome:').replace('mcp__deputy-tools__', '')
+                  : toolName;
+                lastToolUsed = displayName;
+                this.taskQueue.addTaskLog(task.id, {
+                  type: 'tool_use',
+                  message: `Using tool: ${toolName}`,
+                  details: block.input
+                });
+              }
+            }
+          }
+        }
+
+        // Handle user messages (SDK format: message.message contains the actual API message)
+        if (message.type === 'user' && 'message' in message) {
+          const apiMessage = message.message as any;
+          if (apiMessage.content && Array.isArray(apiMessage.content)) {
+            for (const block of apiMessage.content) {
+              if (block.type === 'tool_result' && block.tool_use_id) {
+                const isError = block.is_error || false;
+                if (isError) {
+                  this.taskQueue.addTaskLog(task.id, {
+                    type: 'error',
+                    message: `Tool failed`
+                  });
+                }
+              }
+            }
+          }
         }
 
         // Capture result
         if ('result' in message && message.result) {
           result = message.result;
+          this.taskQueue.addTaskLog(task.id, {
+            type: 'info',
+            message: 'Task completed with result'
+          });
         }
+      }
+
+      // Clear periodic status interval
+      if (statusInterval) {
+        clearInterval(statusInterval);
       }
 
       // Task completed successfully
       this.taskQueue.updateTaskStatus(task.id, 'completed', result);
-      console.log(`Task completed: ${task.title}`);
+      console.log(colors.success(`${statusSymbols.success} Task completed: ${colors.bold(task.title)}\n`));
+
+      // Propagate findings to parent Goal/Responsibility and Context Store
+      await this.propagateTaskFindings(task);
 
       // Update goal progress if applicable
       if (task.parentGoalId) {
@@ -300,15 +505,20 @@ export class Deputy {
         this.goalManager.updateProgress(task.parentGoalId, completed, goalTasks.length);
       }
     } catch (error) {
+      // Clear periodic status interval
+      if (statusInterval) {
+        clearInterval(statusInterval);
+      }
+
       const errorMessage = error instanceof Error ? error.message : String(error);
 
       // Check if it's an approval block
       if (errorMessage.includes('Pending approval')) {
-        console.log(`Task waiting for approval: ${task.title}`);
+        console.log(colors.warning(`${statusSymbols.warning} Task waiting for approval: ${colors.bold(task.title)}`));
         // Task is already marked as waiting_approval by the hook
       } else {
         this.taskQueue.updateTaskStatus(task.id, 'failed', undefined, errorMessage);
-        console.error(`Task failed: ${task.title}`, error);
+        console.error(colors.error(`${statusSymbols.failed} Task failed: ${colors.bold(task.title)}`), error);
       }
     }
 
@@ -386,66 +596,376 @@ export class Deputy {
       case 'status':
         return this.getStatusReport();
 
-      case 'tasks':
-        return this.getTasksReport();
+      case 'tasks': {
+        if (!args || args === 'list') {
+          return this.getTasksReport();
+        }
+
+        const [subcommand, ...subArgs] = args.split(' ');
+
+        switch (subcommand) {
+          case 'add': {
+            if (subArgs.length === 0) {
+              return colors.error('Usage: /tasks add <title> - <description>');
+            }
+            const fullArgs = subArgs.join(' ');
+            const [title, ...descParts] = fullArgs.split(' - ');
+            const description = descParts.join(' - ') || title;
+            const result = this.createTaskFromParams({ title, description });
+            return colors.success(`✓ Created task: ${result.title} (${result.id.slice(0, 8)})`);
+          }
+
+          case 'show': {
+            if (subArgs.length === 0) {
+              return colors.error('Usage: /tasks show <id>');
+            }
+
+            const identifier = subArgs.join(' ');
+            const tasks = this.taskQueue.getAllTasks();
+            const match = tasks.find((t) => t.id.startsWith(identifier));
+
+            if (!match) {
+              return colors.error(`Task not found: ${identifier}`);
+            }
+
+            const contextStr = Object.keys(match.context ?? {}).length > 0
+              ? '\n**Context**: ' + JSON.stringify(match.context, null, 2)
+              : '';
+
+            // Format execution logs
+            const logsStr = match.logs && match.logs.length > 0
+              ? '\n\n## Execution Log\n\n' + match.logs.slice(-20).map((log) => {
+                const timestamp = new Date(log.timestamp).toLocaleTimeString();
+                const icon = log.type === 'tool_use' ? '🔧' : log.type === 'error' ? '❌' : log.type === 'thinking' ? '💭' : 'ℹ️';
+                return `${icon} \`${timestamp}\` ${log.message}`;
+              }).join('\n')
+              : '';
+
+            return renderMarkdown(
+              `# Task Details\n\n` +
+                `**Title**: ${match.title}\n` +
+                `**Description**: ${match.description}\n` +
+                `**Status**: ${match.status}\n` +
+                `**Priority**: ${match.priority}\n` +
+                `**Created**: ${match.createdAt.toISOString()}\n` +
+                `**Updated**: ${match.updatedAt.toISOString()}\n` +
+                `**Due**: ${match.dueDate?.toISOString() ?? 'none'}\n` +
+                `**Result**: ${match.result ?? 'none'}\n` +
+                `**Error**: ${match.error ?? 'none'}\n` +
+                `**Tags**: ${match.tags?.join(', ') ?? 'none'}${contextStr}${logsStr}\n` +
+                `**ID**: \`${match.id}\``
+            );
+          }
+
+          case 'delete': {
+            if (subArgs.length === 0) {
+              return colors.error('Usage: /tasks delete <id>');
+            }
+
+            const identifier = subArgs.join(' ');
+            const tasks = this.taskQueue.getAllTasks();
+            const match = tasks.find((t) => t.id.startsWith(identifier));
+
+            if (!match) {
+              return colors.error(`Task not found: ${identifier}`);
+            }
+
+            this.taskQueue.deleteTask(match.id);
+            return colors.success(`✓ Deleted task: ${match.title}`);
+          }
+
+          default:
+            return colors.error(`Unknown tasks subcommand: ${subcommand}\nUse: list, add, show, delete`);
+        }
+      }
 
       case 'approvals':
         return this.getApprovalsReport();
 
       case 'approve': {
         if (!args) return 'Usage: /approve <approval-id>';
-        const approval = this.approvalQueue.approve(args);
-        if (approval) {
-          this.taskQueue.approveTask(approval.taskId);
-          return `Approved: ${approval.title}`;
+        try {
+          const approval = this.approvalQueue.findApproval(args.trim());
+          if (approval) {
+            this.approvalQueue.approve(approval.id);
+            this.taskQueue.approveTask(approval.taskId);
+            return colors.success(`✓ Approved: ${approval.title}`);
+          }
+          return colors.error('Approval not found');
+        } catch (error) {
+          return colors.error(error instanceof Error ? error.message : 'Approval failed');
         }
-        return 'Approval not found';
       }
 
       case 'reject': {
         if (!args) return 'Usage: /reject <approval-id> <reason>';
         const [id, ...reasonParts] = args.split(' ');
         const reason = reasonParts.join(' ') || 'Rejected by user';
-        const rejection = this.approvalQueue.reject(id, reason);
-        if (rejection) {
-          this.taskQueue.updateTaskStatus(rejection.taskId, 'cancelled');
-          return `Rejected: ${rejection.title}`;
+
+        try {
+          const approval = this.approvalQueue.findApproval(id.trim());
+          if (approval) {
+            this.approvalQueue.reject(approval.id, reason);
+            this.taskQueue.updateTaskStatus(approval.taskId, 'cancelled');
+            return colors.warning(`✗ Rejected: ${approval.title}\nReason: ${reason}`);
+          }
+          return colors.error('Approval not found');
+        } catch (error) {
+          return colors.error(error instanceof Error ? error.message : 'Rejection failed');
         }
-        return 'Approval not found';
       }
 
-      case 'goal': {
-        if (!args) return 'Usage: /goal <title> - <description>';
-        const [title, ...descParts] = args.split(' - ');
-        const description = descParts.join(' - ') || title;
-        const goal = this.goalManager.createGoal({ title, description });
-        return `Created goal: ${goal.title} (${goal.id})`;
-      }
+      case 'goals': {
+        if (!args || args === 'list') {
+          const goals = this.goalManager.getActiveGoals();
+          if (goals.length === 0) return colors.dim('No active goals.');
 
-      case 'task': {
-        if (!args) return 'Usage: /task <title> - <description>';
-        const [title, ...descParts] = args.split(' - ');
-        const description = descParts.join(' - ') || title;
-        const task = this.taskQueue.addTask({ title, description });
-        return `Created task: ${task.title} (${task.id})`;
+          const items = goals
+            .map(
+              (g) =>
+                `- **${g.title}** *(${g.priority})* - ${g.progress}% complete - ${g.taskIds.length} task(s)\n  ${g.description} \`${g.id.slice(0, 8)}\``
+            )
+            .join('\n\n');
+
+          return renderMarkdown(`# Goals\n\n${items}`);
+        }
+
+        const [subcommand, ...subArgs] = args.split(' ');
+
+        switch (subcommand) {
+          case 'add': {
+            if (subArgs.length === 0) {
+              return colors.error('Usage: /goals add <title> - <description>');
+            }
+            const fullArgs = subArgs.join(' ');
+            const [title, ...descParts] = fullArgs.split(' - ');
+            const description = descParts.join(' - ') || title;
+            const result = this.createGoalFromParams({ title, description });
+            return colors.success(`✓ Created goal: ${result.title} (${result.id.slice(0, 8)})`);
+          }
+
+          case 'show': {
+            if (subArgs.length === 0) {
+              return colors.error('Usage: /goals show <id>');
+            }
+
+            const identifier = subArgs.join(' ');
+            const goals = this.goalManager.getAllGoals();
+            const match = goals.find((g) => g.id.startsWith(identifier));
+
+            if (!match) {
+              return colors.error(`Goal not found: ${identifier}`);
+            }
+
+            const contextStr = Object.keys(match.context ?? {}).length > 0
+              ? '\n**Context**: ' + JSON.stringify(match.context, null, 2)
+              : '';
+
+            // Get related tasks
+            const relatedTasks = this.taskQueue.getAllTasks().filter(
+              t => match.taskIds.includes(t.id)
+            );
+            const tasksStr = relatedTasks.length > 0
+              ? '\n\n**Related Tasks** (' + relatedTasks.length + '):\n' +
+                relatedTasks.map(t =>
+                  `- [${t.status}] ${t.title} (\`${t.id.slice(0, 8)}\`)`
+                ).join('\n')
+              : '';
+
+            // Find related responsibilities (responsibilities that have tasks in this goal)
+            const relatedResponsibilities = this.responsibilityManager.getAll().filter(r => {
+              const respTasks = this.taskQueue.getAllTasks().filter(
+                t => t.context?.responsibilityId === r.id
+              );
+              return respTasks.some(t => match.taskIds.includes(t.id));
+            });
+            const responsibilitiesStr = relatedResponsibilities.length > 0
+              ? '\n\n**Related Responsibilities** (' + relatedResponsibilities.length + '):\n' +
+                relatedResponsibilities.map(r =>
+                  `- [${r.status}] ${r.name} (\`${r.id.slice(0, 8)}\`)`
+                ).join('\n')
+              : '';
+
+            return renderMarkdown(
+              `# Goal Details\n\n` +
+                `**Title**: ${match.title}\n` +
+                `**Description**: ${match.description}\n` +
+                `**Status**: ${match.status}\n` +
+                `**Priority**: ${match.priority}\n` +
+                `**Progress**: ${match.progress}%\n` +
+                `**Tasks**: ${match.taskIds.length} task(s)\n` +
+                `**Created**: ${match.createdAt.toISOString()}\n` +
+                `**Updated**: ${match.updatedAt.toISOString()}\n` +
+                `**Tags**: ${match.tags?.join(', ') ?? 'none'}${contextStr}${tasksStr}${responsibilitiesStr}\n` +
+                `**ID**: \`${match.id}\``
+            );
+          }
+
+          case 'delete': {
+            if (subArgs.length === 0) {
+              return colors.error('Usage: /goals delete <id>');
+            }
+
+            const identifier = subArgs.join(' ');
+            const goals = this.goalManager.getAllGoals();
+            const match = goals.find((g) => g.id.startsWith(identifier));
+
+            if (!match) {
+              return colors.error(`Goal not found: ${identifier}`);
+            }
+
+            this.goalManager.deleteGoal(match.id);
+            return colors.success(`✓ Deleted goal: ${match.title}`);
+          }
+
+          default:
+            return colors.error(`Unknown goals subcommand: ${subcommand}\nUse: list, add, show, delete`);
+        }
       }
 
       case 'context': {
-        return this.contextStore.buildContextSummary();
+        if (!args || args === 'list') {
+          // Default to listing all context with full details
+          const entries = this.contextStore.getAllEntries();
+          if (entries.length === 0) {
+            return colors.dim('No context entries.');
+          }
+
+          const byCategory = new Map<string, typeof entries>();
+          for (const entry of entries) {
+            if (!byCategory.has(entry.category)) byCategory.set(entry.category, []);
+            byCategory.get(entry.category)!.push(entry);
+          }
+
+          const sections = Array.from(byCategory.entries()).map(([cat, items]) => {
+            const itemList = items
+              .map((e) => {
+                const valueStr = typeof e.value === 'string' ? e.value : JSON.stringify(e.value);
+                return `- **${e.key}**\n  ${valueStr}\n  \`${e.id.slice(0, 8)}\` *(${Math.round(e.confidence * 100)}% confidence)*`;
+              })
+              .join('\n\n');
+            return `## ${cat.charAt(0).toUpperCase() + cat.slice(1)}\n\n${itemList}`;
+          });
+
+          return renderMarkdown(`# Context (Detailed)\n\n${sections.join('\n\n')}`);
+        }
+
+        const [subcommand, ...subArgs] = args.split(' ');
+
+        switch (subcommand) {
+          case 'add': {
+            if (subArgs.length < 3) {
+              return colors.error(
+                'Usage: /context add <category> <key> <value>\nExample: /context add preference timezone "America/Los_Angeles"'
+              );
+            }
+
+            const [category, key, ...valueParts] = subArgs;
+            const value = valueParts.join(' ');
+
+            if (
+              !['person', 'project', 'company', 'process', 'decision', 'preference', 'knowledge'].includes(
+                category
+              )
+            ) {
+              return colors.error(
+                'Invalid category. Must be: person, project, company, process, decision, preference, knowledge'
+              );
+            }
+
+            const result = this.storeContextFromParams({
+              category: category as any,
+              key,
+              value,
+            });
+
+            return colors.success(`✓ Added/updated context: ${result.key}`);
+          }
+
+          case 'delete': {
+            if (subArgs.length === 0) {
+              return colors.error('Usage: /context delete <id-or-key>');
+            }
+
+            const identifier = subArgs.join(' ');
+
+            // Try by ID first (if it looks like a UUID prefix)
+            if (identifier.length >= 8 && identifier.match(/^[a-f0-9-]+$/i)) {
+              const entries = this.contextStore.getAllEntries();
+              const match = entries.find((e) => e.id.startsWith(identifier));
+              if (match) {
+                this.contextStore.delete(match.id);
+                return colors.success(`✓ Deleted: ${match.key}`);
+              }
+            }
+
+            // Try by key across all categories
+            const entries = this.contextStore.getAllEntries();
+            const match = entries.find((e) => e.key === identifier);
+            if (match) {
+              this.contextStore.delete(match.id);
+              return colors.success(`✓ Deleted: ${match.key}`);
+            }
+
+            return colors.error(`Context entry not found: ${identifier}`);
+          }
+
+          case 'show': {
+            if (subArgs.length === 0) {
+              return colors.error('Usage: /context show <id-or-key>');
+            }
+
+            const identifier = subArgs.join(' ');
+
+            // Try by ID first
+            if (identifier.length >= 8 && identifier.match(/^[a-f0-9-]+$/i)) {
+              const entries = this.contextStore.getAllEntries();
+              const match = entries.find((e) => e.id.startsWith(identifier));
+              if (match) {
+                return renderMarkdown(
+                  `# Context Entry\n\n` +
+                    `**Category**: ${match.category}\n` +
+                    `**Key**: ${match.key}\n` +
+                    `**Value**: ${typeof match.value === 'string' ? match.value : JSON.stringify(match.value, null, 2)}\n` +
+                    `**Source**: ${match.source}\n` +
+                    `**Confidence**: ${Math.round(match.confidence * 100)}%\n` +
+                    `**Created**: ${match.createdAt.toISOString()}\n` +
+                    `**Updated**: ${match.updatedAt.toISOString()}\n` +
+                    `**Tags**: ${match.tags.join(', ') || 'none'}\n` +
+                    `**ID**: \`${match.id}\``
+                );
+              }
+            }
+
+            // Try by key
+            const entries = this.contextStore.getAllEntries();
+            const match = entries.find((e) => e.key === identifier);
+            if (match) {
+              return renderMarkdown(
+                `# Context Entry\n\n` +
+                  `**Category**: ${match.category}\n` +
+                  `**Key**: ${match.key}\n` +
+                  `**Value**: ${typeof match.value === 'string' ? match.value : JSON.stringify(match.value, null, 2)}\n` +
+                  `**Source**: ${match.source}\n` +
+                  `**Confidence**: ${Math.round(match.confidence * 100)}%\n` +
+                  `**Created**: ${match.createdAt.toISOString()}\n` +
+                  `**Updated**: ${match.updatedAt.toISOString()}\n` +
+                  `**Tags**: ${match.tags.join(', ') || 'none'}\n` +
+                  `**ID**: \`${match.id}\``
+              );
+            }
+
+            return colors.error(`Context entry not found: ${identifier}`);
+          }
+
+          default:
+            return colors.error(`Unknown context subcommand: ${subcommand}\nUse /context for usage.`);
+        }
       }
 
-      case 'responsibilities':
-      case 'resp':
-        return this.getResponsibilitiesReport();
-
-      case 'responsibility': {
-        if (!args) {
-          return `Usage:
-/responsibility add <name> | <domain> | <description>
-/responsibility phase <id> <phase>
-/responsibility pause <id>
-/responsibility resume <id>
-/responsibility scan - Force autonomous scan now`;
+      case 'responsibilities': {
+        if (!args || args === 'list') {
+          return this.getResponsibilitiesReport();
         }
 
         const [subCmd, ...subArgs] = args.split(' ');
@@ -454,48 +974,117 @@ export class Deputy {
           case 'add': {
             const parts = subArgs.join(' ').split(' | ');
             if (parts.length < 2) {
-              return 'Usage: /responsibility add <name> | <domain> | <description>';
+              return colors.error('Usage: /responsibilities add <name> | <domain> | <description>');
             }
             const [name, domain, ...descParts] = parts;
             const description = descParts.join(' | ') || name;
-            const resp = this.responsibilityManager.create({
+            const result = this.createResponsibilityFromParams({
               name: name.trim(),
               domain: domain.trim(),
               description: description.trim(),
             });
-            return `Created responsibility: ${resp.name} (${resp.id.slice(0, 8)})`;
+            return colors.success(`✓ Created responsibility: ${result.name} (${result.id.slice(0, 8)})`);
           }
 
           case 'phase': {
             const [id, ...phaseParts] = subArgs;
             const phase = phaseParts.join(' ');
-            if (!id || !phase) return 'Usage: /responsibility phase <id> <phase>';
+            if (!id || !phase) return colors.error('Usage: /responsibilities phase <id> <phase>');
             const resp = this.findResponsibility(id);
-            if (!resp) return 'Responsibility not found';
+            if (!resp) return colors.error('Responsibility not found');
             this.responsibilityManager.setPhase(resp.id, phase);
-            return `Set phase to "${phase}" for ${resp.name}`;
+            return colors.success(`✓ Set phase to "${phase}" for ${resp.name}`);
           }
 
           case 'pause': {
             const resp = this.findResponsibility(subArgs[0]);
-            if (!resp) return 'Responsibility not found';
+            if (!resp) return colors.error('Responsibility not found');
             this.responsibilityManager.pause(resp.id);
-            return `Paused: ${resp.name}`;
+            return colors.success(`✓ Paused: ${resp.name}`);
           }
 
           case 'resume': {
             const resp = this.findResponsibility(subArgs[0]);
-            if (!resp) return 'Responsibility not found';
+            if (!resp) return colors.error('Responsibility not found');
             this.responsibilityManager.resume(resp.id);
-            return `Resumed: ${resp.name}`;
+            return colors.success(`✓ Resumed: ${resp.name}`);
           }
 
-          case 'scan':
-            this.autonomousScanner.forceScan().catch(console.error);
-            return 'Forcing autonomous scan...';
+          case 'show': {
+            if (subArgs.length === 0) {
+              return colors.error('Usage: /responsibilities show <id>');
+            }
+
+            const resp = this.findResponsibility(subArgs[0]);
+            if (!resp) return colors.error('Responsibility not found');
+
+            const cadencesStr = resp.cadences.length > 0
+              ? '\n**Cadences**: ' + resp.cadences.map(c => c.name).join(', ')
+              : '';
+
+            const peopleStr = resp.people.length > 0
+              ? '\n**People**: ' + resp.people.map(p => p.name).join(', ')
+              : '';
+
+            const channelsStr = Object.keys(resp.channels).length > 0
+              ? '\n**Channels**: ' + JSON.stringify(resp.channels, null, 2)
+              : '';
+
+            // Find related tasks
+            const relatedTasks = this.taskQueue.getAllTasks().filter(
+              t => t.context?.responsibilityId === resp.id
+            );
+            const tasksStr = relatedTasks.length > 0
+              ? '\n\n**Related Tasks** (' + relatedTasks.length + '):\n' +
+                relatedTasks.slice(0, 10).map(t =>
+                  `- [${t.status}] ${t.title} (\`${t.id.slice(0, 8)}\`)`
+                ).join('\n') +
+                (relatedTasks.length > 10 ? `\n- ...and ${relatedTasks.length - 10} more` : '')
+              : '';
+
+            // Find related goals (goals that have tasks linked to this responsibility)
+            const relatedGoals = this.goalManager.getAllGoals().filter(g =>
+              g.taskIds.some(taskId =>
+                relatedTasks.some(t => t.id === taskId)
+              )
+            );
+            const goalsStr = relatedGoals.length > 0
+              ? '\n\n**Related Goals** (' + relatedGoals.length + '):\n' +
+                relatedGoals.map(g =>
+                  `- [${g.status}] ${g.title} (\`${g.id.slice(0, 8)}\`) - ${g.progress}%`
+                ).join('\n')
+              : '';
+
+            return renderMarkdown(
+              `# Responsibility Details\n\n` +
+                `**Name**: ${resp.name}\n` +
+                `**Description**: ${resp.description}\n` +
+                `**Domain**: ${resp.domain}\n` +
+                `**Status**: ${resp.status}\n` +
+                `**Phase**: ${resp.phase ?? 'none'}\n` +
+                `**Created**: ${resp.createdAt.toISOString()}\n` +
+                `**Updated**: ${resp.updatedAt.toISOString()}\n` +
+                `**Last Attended**: ${resp.lastAttendedAt?.toISOString() ?? 'never'}${cadencesStr}${peopleStr}${channelsStr}\n` +
+                `**Context**: ${resp.context || 'none'}\n` +
+                `**Recent Activity**: ${resp.recentActivity.length} event(s)\n` +
+                `**ID**: \`${resp.id}\`${tasksStr}${goalsStr}`
+            );
+          }
+
+          case 'delete': {
+            if (subArgs.length === 0) {
+              return colors.error('Usage: /responsibilities delete <id>');
+            }
+
+            const resp = this.findResponsibility(subArgs[0]);
+            if (!resp) return colors.error('Responsibility not found');
+
+            this.responsibilityManager.delete(resp.id);
+            return colors.success(`✓ Deleted responsibility: ${resp.name}`);
+          }
 
           default:
-            return `Unknown subcommand: ${subCmd}`;
+            return colors.error('Unknown responsibilities subcommand. Use: list, add, show, delete, phase, pause, resume');
         }
       }
 
@@ -503,22 +1092,59 @@ export class Deputy {
         this.autonomousScanner.forceScan().catch(console.error);
         return 'Forcing autonomous scan...';
 
-      case 'help':
-        return `Available commands:
-/status - Overall status report
-/tasks - List all tasks
-/approvals - List pending approvals
-/approve <id> - Approve an action
-/reject <id> <reason> - Reject an action
-/goal <title> - <description> - Create a new goal
-/task <title> - <description> - Create a new task
-/responsibilities - List all responsibilities
-/responsibility add <name> | <domain> | <description> - Add ongoing responsibility
-/responsibility phase <id> <phase> - Change phase
-/responsibility pause/resume <id> - Pause or resume
-/scan - Force autonomous scan
-/context - Show accumulated context
-/help - Show this help`;
+      case 'help': {
+        const markdown = `# Deputy Commands
+
+## Monitoring
+- \`/status\` - Overall status report
+- \`/approvals\` - List pending approvals
+
+## Approvals
+- \`/approve <id>\` - Approve an action (use 8+ char ID prefix)
+  - Example: \`/approve a1b2c3d4\`
+- \`/reject <id> <reason>\` - Reject an action
+  - Example: \`/reject a1b2c3d4 Too risky\`
+
+## Tasks
+- \`/tasks [list|add|show|delete]\` - Manage tasks
+  - \`/tasks\` or \`/tasks list\` - List all tasks
+  - \`/tasks add <title> - <description>\` - Create a task
+  - \`/tasks show <id>\` - Show full task details (Tab shows options)
+  - \`/tasks delete <id>\` - Delete a task (Tab shows options)
+
+## Goals
+- \`/goals [list|add|show|delete]\` - Manage goals
+  - \`/goals\` or \`/goals list\` - List all goals
+  - \`/goals add <title> - <description>\` - Create a goal
+  - \`/goals show <id>\` - Show full goal details (Tab shows options)
+  - \`/goals delete <id>\` - Delete a goal (Tab shows options)
+
+## Context
+- \`/context [list|add|show|delete]\` - Manage context entries
+  - \`/context\` or \`/context list\` - List all with IDs & confidence
+  - \`/context add <category> <key> <value>\` - Add/update context
+  - \`/context show <id-or-key>\` - Show full details (Tab shows options)
+  - \`/context delete <id-or-key>\` - Delete entry (Tab shows options)
+  - Categories: person, project, company, process, decision, preference, knowledge
+
+## Responsibilities
+- \`/responsibilities [list|add|show|delete|phase|pause|resume]\` - Manage responsibilities
+  - \`/responsibilities\` or \`/responsibilities list\` - List all
+  - \`/responsibilities add <name> | <domain> | <description>\` - Add new
+  - \`/responsibilities show <id>\` - Show full details (Tab shows options)
+  - \`/responsibilities delete <id>\` - Delete (Tab shows options)
+  - \`/responsibilities phase <id> <phase>\` - Change phase (Tab shows options)
+  - \`/responsibilities pause <id>\` - Pause (Tab shows options)
+  - \`/responsibilities resume <id>\` - Resume (Tab shows options)
+
+## Other
+- \`/scan\` - Force autonomous scan
+- \`/help\` - Show this help message
+
+---
+*Tip: Press Tab after command names to see subcommand options!*`;
+        return renderMarkdown(markdown);
+      }
 
       default:
         return `Unknown command: ${command}. Use /help for available commands.`;
@@ -526,9 +1152,180 @@ export class Deputy {
   }
 
   /**
+   * Reusable method to create a goal (used by MCP tools, slash commands, and scanner)
+   */
+  private createGoalFromParams(params: {
+    title: string;
+    description: string;
+    priority?: 'critical' | 'high' | 'medium' | 'low';
+    tags?: string[];
+  }): { id: string; title: string } {
+    const goal = this.goalManager.createGoal({
+      title: params.title,
+      description: params.description,
+      priority: params.priority ?? 'medium',
+      tags: params.tags ?? [],
+    });
+    console.log(`🎯 Created goal: ${goal.title} (${goal.id.slice(0, 8)})`);
+    return { id: goal.id, title: goal.title };
+  }
+
+  /**
+   * Reusable method to create a responsibility (used by MCP tools, slash commands, and scanner)
+   */
+  private createResponsibilityFromParams(params: {
+    name: string;
+    domain: string;
+    description: string;
+    phase?: string;
+    dailyCadence?: string;
+    weeklyCadence?: string;
+    monthlyCadence?: string;
+  }): { id: string; name: string } {
+    const resp = this.responsibilityManager.create({
+      name: params.name,
+      domain: params.domain,
+      description: params.description,
+      phase: params.phase,
+    });
+
+    // Add cadences if provided
+    if (params.dailyCadence) {
+      this.responsibilityManager.addCadence(resp.id, {
+        name: params.dailyCadence,
+        schedule: { type: 'daily' },
+      });
+    }
+    if (params.weeklyCadence) {
+      this.responsibilityManager.addCadence(resp.id, {
+        name: params.weeklyCadence,
+        schedule: { type: 'weekly', day: 1 }, // Default to Monday
+      });
+    }
+    if (params.monthlyCadence) {
+      this.responsibilityManager.addCadence(resp.id, {
+        name: params.monthlyCadence,
+        schedule: { type: 'monthly', dayOfMonth: 1 }, // Default to 1st of month
+      });
+    }
+
+    console.log(`📋 Created responsibility: ${resp.name} (${resp.id.slice(0, 8)})`);
+    return { id: resp.id, name: resp.name };
+  }
+
+  /**
+   * Reusable method to create a task (used by MCP tools, slash commands, and scanner)
+   */
+  private createTaskFromParams(params: {
+    title: string;
+    description: string;
+    priority?: 'critical' | 'high' | 'medium' | 'low';
+    parentGoalId?: string;
+    context?: Record<string, unknown>;
+  }): { id: string; title: string } {
+    const task = this.taskQueue.addTask({
+      title: params.title,
+      description: params.description,
+      priority: params.priority ?? 'medium',
+      parentGoalId: params.parentGoalId,
+      context: params.context ?? {},
+    });
+
+    // Link to goal if applicable
+    if (params.parentGoalId) {
+      this.goalManager.addTaskToGoal(params.parentGoalId, task.id);
+    }
+
+    console.log(`✅ Created task: ${task.title} (${task.id.slice(0, 8)})`);
+    return { id: task.id, title: task.title };
+  }
+
+  /**
+   * Reusable method to store context (used by MCP tools, slash commands, and scanner)
+   */
+  private storeContextFromParams(params: {
+    category: 'person' | 'project' | 'company' | 'process' | 'decision' | 'preference' | 'knowledge';
+    key: string;
+    value: string;
+    confidence?: number;
+    tags?: string[];
+  }): { key: string; category: string } {
+    const entry = this.contextStore.upsert({
+      category: params.category,
+      key: params.key,
+      value: params.value,
+      source: 'user',
+      confidence: params.confidence ?? 1.0,
+      tags: params.tags ?? [],
+    });
+    console.log(`💾 Stored ${params.category}: ${params.key}`);
+    return { key: entry.key, category: entry.category };
+  }
+
+  /**
+   * Propagate task findings to parent Goal/Responsibility and Context Store
+   */
+  private async propagateTaskFindings(task: Task): Promise<void> {
+    if (!task.result) return;
+
+    // Update parent goal with findings
+    if (task.parentGoalId) {
+      const goal = this.goalManager.getGoal(task.parentGoalId);
+      if (goal) {
+        const taskKey = `task_${task.id.slice(0, 8)}_findings`;
+        this.goalManager.updateGoal(task.parentGoalId, {
+          context: {
+            ...goal.context,
+            [taskKey]: task.result,
+          },
+        });
+      }
+    }
+
+    // Update parent responsibility with findings
+    if (task.context?.responsibilityId) {
+      const respId = task.context.responsibilityId as string;
+      this.responsibilityManager.addContext(
+        respId,
+        `[Task: ${task.title}]\n${task.result.slice(0, 500)}${task.result.length > 500 ? '...' : ''}`
+      );
+      this.responsibilityManager.markAttended(respId);
+      this.responsibilityManager.addActivity(respId, 'task_completed', task.title, task.id);
+    }
+
+    // Extract stakeholders from task context and store them
+    if (task.context?.stakeholders) {
+      const stakeholders = task.context.stakeholders as string;
+      const names = stakeholders.split(',').map((n: string) => n.trim());
+      for (const name of names) {
+        if (name && name.length > 2) {
+          this.contextStore.upsert({
+            category: 'person',
+            key: name,
+            value: `Stakeholder for: ${task.title}`,
+            source: `task:${task.id.slice(0, 8)}`,
+            confidence: 0.7,
+          });
+        }
+      }
+    }
+
+    // Store key findings from task context
+    if (task.context?.key_findings) {
+      this.contextStore.upsert({
+        category: 'knowledge',
+        key: `${task.title.toLowerCase().replace(/\s+/g, '_')}_findings`,
+        value: task.context.key_findings,
+        source: `task:${task.id.slice(0, 8)}`,
+        confidence: 0.8,
+      });
+    }
+  }
+
+  /**
    * Find responsibility by ID prefix
    */
-  private findResponsibility(idPrefix: string): { id: string; name: string } | undefined {
+  private findResponsibility(idPrefix: string): Responsibility | undefined {
     if (!idPrefix) return undefined;
     const all = this.responsibilityManager.getAll();
     return all.find((r) => r.id.startsWith(idPrefix));
@@ -539,16 +1336,28 @@ export class Deputy {
    */
   private getResponsibilitiesReport(): string {
     const all = this.responsibilityManager.getAll();
-    if (all.length === 0) return 'No responsibilities. Use /responsibility add to create one.';
+    if (all.length === 0) return colors.dim('No responsibilities. Use /responsibility add to create one.');
 
-    return all
-      .map((r) => {
-        const phase = r.phase ? ` [${r.phase}]` : '';
-        const status = r.status !== 'active' ? ` (${r.status})` : '';
-        const cadences = r.cadences.length > 0 ? ` - ${r.cadences.length} cadence(s)` : '';
-        return `[${r.domain}] ${r.name}${phase}${status}${cadences}\n  ID: ${r.id.slice(0, 8)}`;
-      })
-      .join('\n\n');
+    const byDomain: { [domain: string]: typeof all } = {};
+    for (const r of all) {
+      if (!byDomain[r.domain]) byDomain[r.domain] = [];
+      byDomain[r.domain].push(r);
+    }
+
+    const sections = Object.entries(byDomain).map(([domain, responsibilities]) => {
+      const items = responsibilities
+        .map((r) => {
+          const phase = r.phase ? ` *(${r.phase})*` : '';
+          const status = r.status !== 'active' ? ` *(${r.status})*` : '';
+          const cadences = r.cadences.length > 0 ? ` - ${r.cadences.length} cadence(s)` : '';
+          return `- **${r.name}**${phase}${status}${cadences} \`${r.id.slice(0, 8)}\``;
+        })
+        .join('\n');
+
+      return `## ${domain}\n\n${items}`;
+    });
+
+    return renderMarkdown(`# Responsibilities\n\n${sections.join('\n\n')}`);
   }
 
   /**
@@ -562,37 +1371,49 @@ export class Deputy {
     const nextScan = this.autonomousScanner.getNextScanTime();
     const minsToScan = Math.max(0, Math.round((nextScan.getTime() - Date.now()) / 60000));
 
-    const domainList = Object.entries(respStats.byDomain)
-      .map(([domain, count]) => `  - ${domain}: ${count}`)
-      .join('\n') || '  None';
+    const domainList =
+      Object.entries(respStats.byDomain)
+        .map(([domain, count]) => `- ${domain}: ${count}`)
+        .join('\n') || 'None';
 
-    return `# Deputy Status
+    const runningStatus = this.state.isRunning ? colors.success('Running') : 'Stopped';
 
-**State**: ${this.state.isRunning ? 'Running' : 'Stopped'}
-**Current Task**: ${this.state.currentTaskId ?? 'None'}
+    const currentTask = this.state.currentTaskId
+      ? (() => {
+          const task = this.taskQueue.getTask(this.state.currentTaskId);
+          return task ? `**${task.title}**` : colors.id(this.state.currentTaskId.slice(0, 8));
+        })()
+      : 'None';
+
+    const markdown = `# Deputy Status
+
+**State**: ${runningStatus}
+**Current Task**: ${currentTask}
 **Next Scan**: ${minsToScan}m
 
 ## Responsibilities
-- Active: ${respStats.active}
+- **Active**: ${respStats.active}
 ${domainList}
 
 ## Goals
-- Active: ${goalStats.active}
-- Completed: ${goalStats.completed}
-- Average Progress: ${goalStats.averageProgress}%
+- **Active**: ${goalStats.active}
+- **Completed**: ${goalStats.completed}
+- **Average Progress**: ${goalStats.averageProgress}%
 
 ## Tasks
-- Pending: ${taskStats.pending}
-- In Progress: ${taskStats.inProgress}
-- Waiting Approval: ${taskStats.waitingApproval}
-- Completed: ${taskStats.completed}
-- Failed: ${taskStats.failed}
+- **Pending**: ${taskStats.pending}
+- **In Progress**: ${taskStats.inProgress}
+- **Waiting Approval**: ${colors.warning(taskStats.waitingApproval.toString())}
+- **Completed**: ${colors.success(taskStats.completed.toString())}
+- **Failed**: ${taskStats.failed > 0 ? colors.error(taskStats.failed.toString()) : '0'}
 
 ## Approvals
-- Pending: ${approvalStats.pending}
-  - High Risk: ${approvalStats.byRisk.high}
-  - Medium Risk: ${approvalStats.byRisk.medium}
-  - Low Risk: ${approvalStats.byRisk.low}`;
+- **Pending**: ${approvalStats.pending}
+  - High Risk: ${colors.highRisk(approvalStats.byRisk.high.toString())}
+  - Medium Risk: ${colors.mediumRisk(approvalStats.byRisk.medium.toString())}
+  - Low Risk: ${colors.lowRisk(approvalStats.byRisk.low.toString())}`;
+
+    return renderMarkdown(markdown);
   }
 
   /**
@@ -600,11 +1421,67 @@ ${domainList}
    */
   private getTasksReport(): string {
     const tasks = this.taskQueue.getAllTasks();
-    if (tasks.length === 0) return 'No tasks.';
+    if (tasks.length === 0) return colors.dim('No tasks.');
 
-    return tasks
-      .map((t) => `[${t.status}] ${t.title} (${t.id.slice(0, 8)})`)
-      .join('\n');
+    const tasksByStatus = {
+      in_progress: tasks.filter((t) => t.status === 'in_progress'),
+      waiting_approval: tasks.filter((t) => t.status === 'waiting_approval'),
+      approved: tasks.filter((t) => t.status === 'approved'),
+      pending: tasks.filter((t) => t.status === 'pending'),
+      completed: tasks.filter((t) => t.status === 'completed'),
+      failed: tasks.filter((t) => t.status === 'failed'),
+      cancelled: tasks.filter((t) => t.status === 'cancelled'),
+    };
+
+    const sections = [];
+
+    if (tasksByStatus.in_progress.length > 0) {
+      sections.push(
+        `## In Progress\n\n` +
+          tasksByStatus.in_progress
+            .map((t) => `- **${t.title}** \`${t.id.slice(0, 8)}\``)
+            .join('\n')
+      );
+    }
+
+    if (tasksByStatus.waiting_approval.length > 0) {
+      sections.push(
+        `## Waiting Approval\n\n` +
+          tasksByStatus.waiting_approval
+            .map((t) => `- **${t.title}** \`${t.id.slice(0, 8)}\``)
+            .join('\n')
+      );
+    }
+
+    if (tasksByStatus.approved.length > 0) {
+      sections.push(
+        `## Approved\n\n` +
+          tasksByStatus.approved.map((t) => `- **${t.title}** \`${t.id.slice(0, 8)}\``).join('\n')
+      );
+    }
+
+    if (tasksByStatus.pending.length > 0) {
+      sections.push(
+        `## Pending\n\n` +
+          tasksByStatus.pending.map((t) => `- **${t.title}** \`${t.id.slice(0, 8)}\``).join('\n')
+      );
+    }
+
+    if (tasksByStatus.completed.length > 0) {
+      sections.push(
+        `## Completed\n\n` +
+          tasksByStatus.completed.map((t) => `- ${t.title} \`${t.id.slice(0, 8)}\``).join('\n')
+      );
+    }
+
+    if (tasksByStatus.failed.length > 0) {
+      sections.push(
+        `## Failed\n\n` +
+          tasksByStatus.failed.map((t) => `- ${t.title} \`${t.id.slice(0, 8)}\``).join('\n')
+      );
+    }
+
+    return renderMarkdown(`# Tasks\n\n${sections.join('\n\n')}`);
   }
 
   /**
@@ -612,11 +1489,21 @@ ${domainList}
    */
   private getApprovalsReport(): string {
     const pending = this.approvalQueue.getPending();
-    if (pending.length === 0) return 'No pending approvals.';
+    if (pending.length === 0) return colors.dim('No pending approvals.');
 
-    return pending
-      .map((a) => `[${a.risk}] ${a.title}\n  ID: ${a.id}\n  Action: ${a.proposedAction}`)
+    const items = pending
+      .map((a, idx) => {
+        const shortId = a.id.slice(0, 8);
+        const riskBadge =
+          a.risk === 'high' ? colors.highRisk(`[HIGH]`) : a.risk === 'medium' ? colors.mediumRisk(`[MEDIUM]`) : colors.lowRisk(`[LOW]`);
+        return `${idx + 1}. ${riskBadge} **${a.title}**
+   - ID: \`${shortId}\`
+   - Action: ${a.proposedAction}
+   - Command: \`/approve ${shortId}\` or \`/reject ${shortId} <reason>\``;
+      })
       .join('\n\n');
+
+    return renderMarkdown(`# Pending Approvals\n\n${items}`);
   }
 
   /**
@@ -705,12 +1592,12 @@ ${domainList}
       version: "1.0.0",
       tools: [
         tool(
-          "StoreKnowledge",
-          "Store knowledge, learnings, preferences, or insights for future reference. Use this when you learn something new, discover a preference, or want to remember a pattern.",
+          "StoreContext",
+          "Store context, learnings, preferences, or insights for future reference. Use this when you learn something new, discover a preference, or want to remember a pattern.",
           {
-            category: z.enum(["knowledge", "process", "preference", "decision", "person", "project", "company"]).describe("Category of knowledge being stored"),
-            key: z.string().describe("Short identifier for this knowledge (e.g., 'screenshot-validation-delay', 'user-prefers-summaries')"),
-            value: z.string().describe("The actual knowledge, learning, or insight to store"),
+            category: z.enum(["knowledge", "process", "preference", "decision", "person", "project", "company"]).describe("Category of context being stored"),
+            key: z.string().describe("Short identifier for this context (e.g., 'screenshot-validation-delay', 'user-prefers-summaries')"),
+            value: z.string().describe("The actual context, learning, or insight to store"),
             confidence: z.number().optional().default(0.8).describe("Confidence level 0-1 (default 0.8)"),
             tags: z.array(z.string()).optional().describe("Optional tags for cross-cutting searches")
           },
@@ -724,7 +1611,80 @@ ${domainList}
               tags: args.tags ?? []
             });
             console.log(`📝 Stored: ${args.key}`);
-            return { content: [{ type: "text" as const, text: `Knowledge stored successfully: ${args.key}` }] };
+            return { content: [{ type: "text" as const, text: `Context stored successfully: ${args.key}` }] };
+          }
+        ),
+
+        tool(
+          "DeleteContext",
+          "Delete incorrect or outdated context by key name. Use this when you discover context is wrong or no longer relevant.",
+          {
+            key: z.string().describe("The key of the context entry to delete (e.g., 'current_strategic_priorities_q1_2026')")
+          },
+          async (args) => {
+            const entries = this.contextStore.getAllEntries();
+            const match = entries.find((e) => e.key === args.key);
+
+            if (match) {
+              this.contextStore.delete(match.id);
+              console.log(`🗑️  Deleted: ${match.key}`);
+              return { content: [{ type: "text" as const, text: `Context deleted: ${match.key}` }] };
+            }
+
+            return { content: [{ type: "text" as const, text: `Context not found: ${args.key}` }] };
+          }
+        ),
+
+        tool(
+          "UpdateContext",
+          "Update existing context with new information. Use this when correcting or refining previously stored context.",
+          {
+            key: z.string().describe("The key of the context entry to update"),
+            value: z.string().optional().describe("New value for the context"),
+            confidence: z.number().optional().describe("Updated confidence level 0-1"),
+            tags: z.array(z.string()).optional().describe("Updated tags")
+          },
+          async (args) => {
+            const entries = this.contextStore.getAllEntries();
+            const match = entries.find((e) => e.key === args.key);
+
+            if (match) {
+              const updated = this.contextStore.update(match.id, {
+                value: args.value,
+                confidence: args.confidence,
+                tags: args.tags
+              });
+
+              if (updated) {
+                console.log(`✏️  Updated: ${args.key}`);
+                return { content: [{ type: "text" as const, text: `Context updated: ${args.key}` }] };
+              }
+            }
+
+            return { content: [{ type: "text" as const, text: `Context not found: ${args.key}` }] };
+          }
+        ),
+
+        tool(
+          "ListContext",
+          "List all stored context, optionally filtered by category. Useful for reviewing what you know before making decisions.",
+          {
+            category: z.enum(["knowledge", "process", "preference", "decision", "person", "project", "company"]).optional().describe("Optional category filter")
+          },
+          async (args) => {
+            const entries = args.category
+              ? this.contextStore.getByCategory(args.category)
+              : this.contextStore.getAllEntries();
+
+            if (entries.length === 0) {
+              return { content: [{ type: "text" as const, text: args.category ? `No ${args.category} context found` : "No context stored yet" }] };
+            }
+
+            const summary = entries
+              .map((e) => `- [${e.category}] ${e.key}: ${typeof e.value === 'string' ? e.value : JSON.stringify(e.value)} (${Math.round(e.confidence * 100)}%)`)
+              .join('\n');
+
+            return { content: [{ type: "text" as const, text: `Knowledge entries (${entries.length}):\n${summary}` }] };
           }
         ),
 
@@ -738,14 +1698,8 @@ ${domainList}
             tags: z.array(z.string()).optional().describe("Optional tags")
           },
           async (args) => {
-            const goal = this.goalManager.createGoal({
-              title: args.title,
-              description: args.description,
-              priority: args.priority ?? "medium",
-              tags: args.tags ?? []
-            });
-            console.log(`🎯 Created goal: ${goal.title} (${goal.id.slice(0, 8)})`);
-            return { content: [{ type: "text" as const, text: `Goal created: ${goal.title}` }] };
+            const result = this.createGoalFromParams(args);
+            return { content: [{ type: "text" as const, text: `Goal created: ${result.title}` }] };
           }
         ),
 
@@ -762,35 +1716,8 @@ ${domainList}
             monthlyCadence: z.string().optional().describe("Monthly cadence description")
           },
           async (args) => {
-            const resp = this.responsibilityManager.create({
-              name: args.name,
-              domain: args.domain,
-              description: args.description,
-              phase: args.phase
-            });
-
-            // Add cadences if provided
-            if (args.dailyCadence) {
-              this.responsibilityManager.addCadence(resp.id, {
-                name: args.dailyCadence,
-                schedule: { type: 'daily' }
-              });
-            }
-            if (args.weeklyCadence) {
-              this.responsibilityManager.addCadence(resp.id, {
-                name: args.weeklyCadence,
-                schedule: { type: 'weekly', day: 1 } // Default to Monday
-              });
-            }
-            if (args.monthlyCadence) {
-              this.responsibilityManager.addCadence(resp.id, {
-                name: args.monthlyCadence,
-                schedule: { type: 'monthly', dayOfMonth: 1 } // Default to 1st of month
-              });
-            }
-
-            console.log(`📋 Created responsibility: ${resp.name} (${resp.id.slice(0, 8)})`);
-            return { content: [{ type: "text" as const, text: `Responsibility created: ${resp.name}` }] };
+            const result = this.createResponsibilityFromParams(args);
+            return { content: [{ type: "text" as const, text: `Responsibility created: ${result.name}` }] };
           }
         ),
 
@@ -805,15 +1732,130 @@ ${domainList}
             context: z.record(z.string(), z.unknown()).optional().describe("Additional context for the task")
           },
           async (args) => {
-            const task = this.taskQueue.addTask({
+            const result = this.createTaskFromParams(args);
+            return { content: [{ type: "text" as const, text: `Task created: ${result.title}` }] };
+          }
+        ),
+
+        tool(
+          "UpdateGoal",
+          "Update an existing goal's title, description, or priority",
+          {
+            goalId: z.string().describe("Goal ID to update"),
+            title: z.string().optional().describe("New title"),
+            description: z.string().optional().describe("New description"),
+            priority: z.enum(["critical", "high", "medium", "low"]).optional().describe("New priority")
+          },
+          async (args) => {
+            const goal = this.goalManager.updateGoal(args.goalId, {
               title: args.title,
               description: args.description,
-              priority: args.priority ?? "medium",
-              parentGoalId: args.parentGoalId,
-              context: args.context ?? {}
+              priority: args.priority
             });
-            console.log(`✅ Created task: ${task.title} (${task.id.slice(0, 8)})`);
-            return { content: [{ type: "text" as const, text: `Task created: ${task.title}` }] };
+            if (goal) {
+              console.log(`✏️  Updated goal: ${goal.title} (${goal.id.slice(0, 8)})`);
+              return { content: [{ type: "text" as const, text: `Goal updated: ${goal.title}` }] };
+            }
+            return { content: [{ type: "text" as const, text: `Goal not found: ${args.goalId}` }] };
+          }
+        ),
+
+        tool(
+          "DeleteGoal",
+          "Delete a goal when it becomes obsolete or was created in error",
+          {
+            goalId: z.string().describe("Goal ID to delete")
+          },
+          async (args) => {
+            const goal = this.goalManager.getGoal(args.goalId);
+            if (goal) {
+              this.goalManager.deleteGoal(args.goalId);
+              console.log(`🗑️  Deleted goal: ${goal.title} (${goal.id.slice(0, 8)})`);
+              return { content: [{ type: "text" as const, text: `Goal deleted: ${goal.title}` }] };
+            }
+            return { content: [{ type: "text" as const, text: `Goal not found: ${args.goalId}` }] };
+          }
+        ),
+
+        tool(
+          "UpdateResponsibility",
+          "Update an existing responsibility's name, description, domain, or phase",
+          {
+            responsibilityId: z.string().describe("Responsibility ID to update"),
+            name: z.string().optional().describe("New name"),
+            description: z.string().optional().describe("New description"),
+            domain: z.string().optional().describe("New domain"),
+            phase: z.string().optional().describe("New phase")
+          },
+          async (args) => {
+            const resp = this.responsibilityManager.get(args.responsibilityId);
+            if (resp) {
+              if (args.name) this.responsibilityManager.update(args.responsibilityId, { name: args.name });
+              if (args.description) this.responsibilityManager.update(args.responsibilityId, { description: args.description });
+              if (args.domain) this.responsibilityManager.update(args.responsibilityId, { domain: args.domain });
+              if (args.phase) this.responsibilityManager.setPhase(args.responsibilityId, args.phase);
+              console.log(`✏️  Updated responsibility: ${resp.name} (${resp.id.slice(0, 8)})`);
+              return { content: [{ type: "text" as const, text: `Responsibility updated: ${resp.name}` }] };
+            }
+            return { content: [{ type: "text" as const, text: `Responsibility not found: ${args.responsibilityId}` }] };
+          }
+        ),
+
+        tool(
+          "DeleteResponsibility",
+          "Delete a responsibility when it's no longer needed",
+          {
+            responsibilityId: z.string().describe("Responsibility ID to delete")
+          },
+          async (args) => {
+            const resp = this.responsibilityManager.get(args.responsibilityId);
+            if (resp) {
+              this.responsibilityManager.delete(args.responsibilityId);
+              console.log(`🗑️  Deleted responsibility: ${resp.name} (${resp.id.slice(0, 8)})`);
+              return { content: [{ type: "text" as const, text: `Responsibility deleted: ${resp.name}` }] };
+            }
+            return { content: [{ type: "text" as const, text: `Responsibility not found: ${args.responsibilityId}` }] };
+          }
+        ),
+
+        tool(
+          "UpdateTask",
+          "Update an existing task's title, description, or priority",
+          {
+            taskId: z.string().describe("Task ID to update"),
+            title: z.string().optional().describe("New title"),
+            description: z.string().optional().describe("New description"),
+            priority: z.enum(["critical", "high", "medium", "low"]).optional().describe("New priority")
+          },
+          async (args) => {
+            const task = this.taskQueue.getTask(args.taskId);
+            if (task) {
+              this.taskQueue.updateTask(args.taskId, {
+                title: args.title,
+                description: args.description,
+                priority: args.priority
+              });
+              console.log(`✏️  Updated task: ${task.title} (${task.id.slice(0, 8)})`);
+              return { content: [{ type: "text" as const, text: `Task updated: ${task.title}` }] };
+            }
+            return { content: [{ type: "text" as const, text: `Task not found: ${args.taskId}` }] };
+          }
+        ),
+
+        tool(
+          "DeleteTask",
+          "Delete a task when it's no longer needed or was created in error",
+          {
+            taskId: z.string().describe("Task ID to delete")
+          },
+          async (args) => {
+            const task = this.taskQueue.getTask(args.taskId);
+            if (task) {
+              this.taskQueue.deleteTask(args.taskId);
+              console.log(`🗑️  Deleted task: ${task.title} (${task.id.slice(0, 8)})`);
+              return { content: [{ type: "text" as const, text: `Task deleted: ${task.title}` }] };
+            }
+            return { content: [{ type: "text" as const, text: `Task not found: ${args.taskId}` }] };
           }
         ),
 

@@ -101,6 +101,33 @@ export class ApprovalQueue {
   }
 
   /**
+   * Find approval by ID or ID prefix (min 8 chars for safety)
+   */
+  findApproval(idOrPrefix: string): ApprovalRequest | undefined {
+    if (!idOrPrefix) return undefined;
+
+    // Try exact match first
+    const exact = this.approvals.get(idOrPrefix);
+    if (exact) return exact;
+
+    // Try prefix match (minimum 8 chars for safety)
+    if (idOrPrefix.length >= 8) {
+      const matches = Array.from(this.approvals.values()).filter((a) =>
+        a.id.startsWith(idOrPrefix)
+      );
+
+      if (matches.length === 1) return matches[0];
+      if (matches.length > 1) {
+        throw new Error(
+          `Ambiguous ID prefix "${idOrPrefix}" matches ${matches.length} approvals. Use more characters.`
+        );
+      }
+    }
+
+    return undefined;
+  }
+
+  /**
    * Get approval for a specific task
    */
   getApprovalForTask(taskId: string): ApprovalRequest | undefined {

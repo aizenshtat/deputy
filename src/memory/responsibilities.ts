@@ -413,6 +413,15 @@ export class ResponsibilityManager {
   }
 
   /**
+   * Delete a responsibility
+   */
+  delete(id: string): boolean {
+    const deleted = this.responsibilities.delete(id);
+    if (deleted) this.notifyChange();
+    return deleted;
+  }
+
+  /**
    * Subscribe to changes
    */
   onChange(callback: () => void): () => void {

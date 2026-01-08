@@ -136,6 +136,27 @@ export class GoalManager {
   }
 
   /**
+   * Delete a goal
+   */
+  deleteGoal(goalId: string): boolean {
+    const deleted = this.goals.delete(goalId);
+    if (deleted) this.notifyChange();
+    return deleted;
+  }
+
+  /**
+   * Update a goal with partial updates
+   */
+  updateGoal(goalId: string, updates: Partial<Omit<Goal, 'id' | 'createdAt'>>): Goal | undefined {
+    const goal = this.goals.get(goalId);
+    if (!goal) return undefined;
+
+    Object.assign(goal, updates, { updatedAt: new Date() });
+    this.notifyChange();
+    return goal;
+  }
+
+  /**
    * Get statistics
    */
   getStats(): {
