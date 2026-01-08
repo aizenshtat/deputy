@@ -342,8 +342,9 @@ export class Deputy {
     const taskStartTime = Date.now();
     let latestAction = '';
 
-    // Track tool execution times
+    // Track tool execution times and tool names
     const toolStartTimes = new Map<string, number>();
+    const toolNames = new Map<string, string>();
 
     const updateStatusBar = () => {
       const elapsed = Math.floor((Date.now() - taskStartTime) / 1000);
@@ -443,9 +444,10 @@ export class Deputy {
                 const toolName = block.name;
                 const toolUseId = block.id;
 
-                // Track tool start time
+                // Track tool start time and name
                 if (toolUseId) {
                   toolStartTimes.set(toolUseId, Date.now());
+                  toolNames.set(toolUseId, toolName);
                 }
 
                 // Shorten MCP tool names for display
@@ -482,6 +484,7 @@ export class Deputy {
               if (block.type === 'tool_result' && block.tool_use_id) {
                 const isError = block.is_error || false;
                 const toolUseId = block.tool_use_id;
+                const wasTaskTool = toolNames.get(toolUseId) === 'Task';
 
                 // Calculate tool duration if we tracked the start time
                 let durationMsg = '';
@@ -490,6 +493,17 @@ export class Deputy {
                   const duration = Math.round((Date.now() - startTime) / 1000);
                   durationMsg = duration > 3 ? ` (${duration}s)` : '';
                   toolStartTimes.delete(toolUseId);
+                }
+
+                // For Task tool results, extract subagent activity summary
+                if (wasTaskTool && !isError && block.content) {
+                  const subagentSummary = this.extractSubagentSummary(block.content);
+                  if (subagentSummary.length > 0) {
+                    this.taskQueue.addTaskLog(task.id, {
+                      type: 'info',
+                      message: `**Subagent activity:**\n${subagentSummary.join('\n')}`
+                    });
+                  }
                 }
 
                 if (isError) {
@@ -504,6 +518,9 @@ export class Deputy {
                     message: `Tool completed${durationMsg}`
                   });
                 }
+
+                // Clean up tool name tracking
+                toolNames.delete(toolUseId);
               }
             }
           }
@@ -1613,6 +1630,35 @@ ${domainList}
 
   getCurrentTaskId(): string | undefined {
     return this.state.currentTaskId;
+  }
+
+  /**
+   * Extract subagent activity summary from Task tool result
+   */
+  private extractSubagentSummary(content: any): string[] {
+    const summary: string[] = [];
+
+    try {
+      // Task tool returns array of text blocks with the subagent's result
+      if (typeof content === 'string') {
+        // Simple string result - show a preview
+        const preview = content.slice(0, 200);
+        summary.push(`  → Result: ${preview}${content.length > 200 ? '...' : ''}`);
+      } else if (Array.isArray(content)) {
+        // Array of content blocks - extract text
+        for (const item of content) {
+          if (item.type === 'text' && item.text) {
+            const preview = item.text.slice(0, 200);
+            summary.push(`  → ${preview}${item.text.length > 200 ? '...' : ''}`);
+          }
+        }
+      }
+    } catch (error) {
+      // If parsing fails, just skip the summary
+    }
+
+    // Limit to 3 lines to avoid spam
+    return summary.slice(0, 3);
   }
 
   private sleep(ms: number): Promise<void> {

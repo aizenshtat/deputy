@@ -39,7 +39,7 @@ EXANTE has **multiple AI initiatives in progress** across different domains, but
 
 ### Data Sources NOT Accessible
 ❌ **Slack #ai-endgame channel** - Requires manual review
-❌ **Slack #ai_code_generation channel** - Requires manual review
+✅ **Slack #ai_code_generation channel** - REVIEWED (Jan 8, 2026)
 ❌ **Slack #sales-ai / #salesmind channels** - Requires manual review
 ❌ **AI roadmap documents** - Location unknown
 ❌ **AI budget/resource allocation** - Not accessible
@@ -165,33 +165,68 @@ EXANTE has **multiple AI initiatives in progress** across different domains, but
 
 ---
 
-### 4. AI Code Generation 🔵 UNKNOWN
+### 4. AI Code Generation 🟡 COMMUNITY/INFORMAL
 
 **Domain:** Developer Productivity
-**Status:** Unknown - Channel exists but not reviewed
-**Channel:** #ai_code_generation
+**Status:** REVIEWED (Jan 8, 2026) - Informal knowledge-sharing community, not a coordinated initiative
+**Channel:** #ai_code_generation (120 members)
+**Channel Created:** Before Nov 2025
 
-**Hypotheses (To Be Verified):**
-- Likely discussions about GitHub Copilot, Claude Code, Cursor, etc.
-- Developer adoption and best practices
-- Productivity metrics and ROI
-- Integration with engineering workflows
-- Potential resistance or enthusiasts
+**Key Findings from Channel Review:**
 
-**Questions for Channel Review:**
-1. Which tools are being evaluated or adopted?
-2. What's the adoption rate across engineering teams?
-3. Any measured productivity improvements?
-4. Barriers to adoption (cost, security, learning curve)?
-5. Who are the champions driving adoption?
-6. Integration with CI/CD pipelines?
-7. Code quality impacts (positive or negative)?
+**Activity Level:** MODERATE - Sporadic discussions, mostly sharing tools/news
+- Last significant activity: Early January 2026
+- Pattern: Tool announcements, links to videos/articles, informal reactions
+- NOT a formal project with goals, roadmap, or metrics
+
+**Tools Discussed:**
+1. **Cursor** - Multiple discussions, team experimenting
+2. **Claude Code** - Shared by Daniil (CEO interest confirmed from Jan 5 conversation)
+3. **Google's Cursor competitor** - Discussed Nov 18, 2025 (Gemini 3 Pro based, free during preview)
+4. **Playwright** - For testing (mentioned in CEO's Claude Code experiments Dec 30)
+
+**Notable Participants:**
+- **Daniil Aizenshtat** (PMO/Strategy lead) - Active sharer, links tools
+- **Denis Voskvitsov** - Shared Google Cursor competitor info
+- **Anton Omelianenko** - Contributor (screenshots)
+- **Ruslan Yeleussinov** - Asked about internal LLM deployment (Dec 30: "есть ли в компании своя запущенная модель LLM типа Deepseek или Llama?")
+- **Nastya Silantyeva** - Joined Nov 19, 2025
+- **120 total members** including Anatoly Bobunov and others
+
+**Key Themes:**
+1. **Tool Exploration** - Team members trying various AI coding assistants
+2. **No Standardization** - No official company policy or approved toolset
+3. **Organic Adoption** - Engineers adopting tools independently
+4. **Security Awareness** - Denis noted Google logs all interactions for training
+5. **CEO Experimentation** - Alexey testing Claude Code "круглосуточно в режиме ultrathink" (24/7 in ultrathink mode) with Gemini consultations
+
+**What's MISSING (Critical Gaps):**
+- ❌ No productivity metrics or ROI measurement
+- ❌ No official tool evaluation or procurement process
+- ❌ No security/IP protection policy for code sent to AI vendors
+- ❌ No best practices documentation
+- ❌ No training program for developers
+- ❌ No budget or license management
+- ❌ No integration with official development workflows
+- ❌ Question about internal LLM from Dec 30 went unanswered (no one knows if EXANTE has deployed own models)
+
+**CEO's AI Coding Vision (from Jan 5, 2026):**
+From Alexey-Daniil conversation: CEO testing Claude Code with Firebase, Gemini, EXANTE access - "границы возможностей" (limits of capabilities) exploration. Also mentioned vision for "ИИ надзирателей" (AI supervisors) for every employee.
 
 **Coordination Opportunities:**
-- Could accelerate SalesMind, Onboarding, Trading AI development
-- Shared learning across all engineering teams
-- Centralized procurement/licensing if multiple tools
-- Security and IP protection policies needed
+- **HIGH PRIORITY:** Establish official AI coding tools policy
+- Measure productivity impact (before/after metrics)
+- Create security guidelines for code exposure to external AI
+- Centralize licensing/procurement
+- Share AI coding best practices across SalesMind, Onboarding, Trading teams
+- Leverage for faster development on all AI initiatives
+- Connect to CEO's broader AI vision
+
+**Recommended Next Steps:**
+1. Survey developers on current AI tool usage (Shadow IT assessment)
+2. Evaluate security implications with InfoSec team
+3. Pilot formal program with metrics
+4. Answer Ruslan's question: Should EXANTE deploy internal LLM?
 
 ---
 
