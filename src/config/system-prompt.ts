@@ -171,19 +171,45 @@ ${contextSummary}
 `;
 }
 
-export function buildTaskPrompt(task: { title: string; description: string; context: Record<string, unknown> }): string {
+export function buildTaskPrompt(params: {
+  task: { title: string; description: string; context: Record<string, unknown> };
+  parentGoal?: { title: string; description: string; progress: number };
+  parentResponsibility?: { name: string; description: string; domain: string };
+  siblingTasks?: Array<{ title: string; status: string; result?: string }>;
+}): string {
+  const { task, parentGoal, parentResponsibility, siblingTasks } = params;
+
   const contextStr = Object.keys(task.context).length > 0
     ? '\n\nTask Context:\n' + JSON.stringify(task.context, null, 2)
+    : '';
+
+  // Parent goal context
+  const goalStr = parentGoal
+    ? `\n\n## Parent Goal\n**${parentGoal.title}** (${parentGoal.progress}% complete)\n${parentGoal.description}`
+    : '';
+
+  // Parent responsibility context
+  const respStr = parentResponsibility
+    ? `\n\n## Parent Responsibility\n**${parentResponsibility.name}** (${parentResponsibility.domain})\n${parentResponsibility.description}`
+    : '';
+
+  // Sibling tasks context (what's already been done)
+  const siblingsStr = siblingTasks && siblingTasks.length > 0
+    ? '\n\n## Related Tasks\n' +
+      siblingTasks
+        .map((t) => `- [${t.status}] ${t.title}${t.result ? '\n  Result: ' + t.result.slice(0, 200) : ''}`)
+        .join('\n')
     : '';
 
   return `Execute this task:
 
 **${task.title}**
 
-${task.description}${contextStr}
+${task.description}${contextStr}${goalStr}${respStr}${siblingsStr}
 
 Guidelines:
 - Complete the task thoroughly
+- Avoid duplicating work already done in related tasks
 - Request approval for any significant actions
 - Update task context with relevant findings
 - Report results clearly`;

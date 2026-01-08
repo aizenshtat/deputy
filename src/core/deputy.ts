@@ -367,7 +367,60 @@ export class Deputy {
         approvalQueue: this.approvalQueue,
       });
 
-      const taskPrompt = buildTaskPrompt(task);
+      // Build enriched task context with parent goal, responsibility, and sibling tasks
+      let parentGoal: { title: string; description: string; progress: number } | undefined;
+      let parentResponsibility: { name: string; description: string; domain: string } | undefined;
+      let siblingTasks: Array<{ title: string; status: string; result?: string }> = [];
+
+      // Get parent goal if task is linked to one
+      if (task.parentGoalId) {
+        const goal = this.goalManager.getGoal(task.parentGoalId);
+        if (goal) {
+          parentGoal = {
+            title: goal.title,
+            description: goal.description,
+            progress: goal.progress,
+          };
+          // Get sibling tasks (other tasks in the same goal)
+          siblingTasks = this.taskQueue.getTasksByGoal(task.parentGoalId)
+            .filter((t) => t.id !== task.id) // Exclude current task
+            .map((t) => ({
+              title: t.title,
+              status: t.status,
+              result: t.result,
+            }));
+        }
+      }
+
+      // Get parent responsibility if task is linked to one
+      if (task.context?.responsibilityId) {
+        const resp = this.responsibilityManager.getAll()
+          .find((r) => r.id === task.context.responsibilityId);
+        if (resp) {
+          parentResponsibility = {
+            name: resp.name,
+            description: resp.description,
+            domain: resp.domain,
+          };
+          // If no parent goal, get sibling tasks from responsibility
+          if (!parentGoal) {
+            siblingTasks = this.taskQueue.getAllTasks()
+              .filter((t) => t.context?.responsibilityId === resp.id && t.id !== task.id)
+              .map((t) => ({
+                title: t.title,
+                status: t.status,
+                result: t.result,
+              }));
+          }
+        }
+      }
+
+      const taskPrompt = buildTaskPrompt({
+        task,
+        parentGoal,
+        parentResponsibility,
+        siblingTasks,
+      });
 
       let result = '';
 

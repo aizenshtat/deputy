@@ -118,6 +118,15 @@ export class AutonomousScanner {
       })
       .slice(0, 10); // Limit to 10 most recent
 
+    // 5. Get ALL recent tasks (last 72 hours) to avoid creating duplicates
+    const recentTasks = this.taskQueue.getAllTasks()
+      .filter((t) => {
+        const hoursSinceUpdate = (Date.now() - t.updatedAt.getTime()) / (1000 * 60 * 60);
+        return hoursSinceUpdate <= 72;
+      })
+      .sort((a, b) => b.updatedAt.getTime() - a.updatedAt.getTime())
+      .slice(0, 30); // Limit to 30 most recent
+
     // If nothing needs attention, skip LLM call
     if (dueCadences.length === 0 && needingAttention.length === 0 && goalsWithoutTasks.length === 0 && recentlyCompletedTasks.length === 0) {
       console.log('[SCAN] Nothing needs attention');
@@ -130,8 +139,8 @@ export class AutonomousScanner {
       };
     }
 
-    // 5. Build context for LLM
-    const planningPrompt = this.buildPlanningPrompt(dueCadences, needingAttention, goalsWithoutTasks, recentlyCompletedTasks);
+    // 6. Build context for LLM
+    const planningPrompt = this.buildPlanningPrompt(dueCadences, needingAttention, goalsWithoutTasks, recentlyCompletedTasks, recentTasks);
 
     // 6. Invoke LLM with MCP tools - it will create goals, responsibilities, tasks, and context as needed
     let tasksCreated = 0;
@@ -166,7 +175,8 @@ export class AutonomousScanner {
     dueCadences: Array<{ responsibility: Responsibility; cadence: Cadence }>,
     needingAttention: Responsibility[],
     goalsWithoutTasks: Array<{ id: string; title: string; description: string }>,
-    recentlyCompletedTasks: Array<{ id: string; title: string; description: string; result?: string; context?: Record<string, unknown> }>
+    recentlyCompletedTasks: Array<{ id: string; title: string; description: string; result?: string; context?: Record<string, unknown> }>,
+    recentTasks: Array<{ id: string; title: string; description: string; status: string; updatedAt: Date }>
   ): string {
     const now = new Date();
     const dayOfWeek = ['Sunday', 'Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday', 'Saturday'][now.getDay()];
@@ -234,6 +244,16 @@ You are Deputy, an autonomous executive assistant. Review the following and dete
       }
     }
 
+    // Recent tasks (to avoid duplicates)
+    if (recentTasks.length > 0) {
+      prompt += `## Recent Tasks (last 72 hours - avoid creating duplicates)\n\n`;
+      for (const t of recentTasks) {
+        const hoursAgo = Math.round((Date.now() - t.updatedAt.getTime()) / (1000 * 60 * 60));
+        prompt += `- [${t.status}] ${t.title} (${hoursAgo}h ago)\n`;
+      }
+      prompt += '\n';
+    }
+
     // Context summary
     const contextSummary = this.contextStore.buildContextSummary();
     if (contextSummary) {
@@ -242,11 +262,32 @@ You are Deputy, an autonomous executive assistant. Review the following and dete
 
     prompt += `## Instructions
 
-Use the available MCP tools to create what's needed:
+**IMPORTANT HIERARCHY - Follow this order:**
 
-**CreateGoal** - For finite outcomes with completion criteria
-  - Example: "Hire Compliance Assurance Head", "Launch Q2 dashboard"
+1. **Responsibility → Goal → Tasks** (preferred flow)
+   - Responsibility: Ongoing area (e.g., "Elevated Priority meetings")
+   - Goal: Specific outcome (e.g., "Conduct Jan 13 Elevated Priority meeting")
+   - Tasks: Concrete actions (e.g., "Prepare agenda", "Create slides", "Send follow-ups")
+
+2. **AVOID creating standalone Tasks** - Tasks should almost always have a parent Goal
+   - Exception: Quick context-gathering tasks directly for a Responsibility
+
+3. **Before creating Tasks, check if similar work was recently done**
+   - Look at recently completed tasks in the same responsibility/goal
+   - Don't duplicate work - build on what's already done
+
+Use the available MCP tools:
+
+**CreateGoal** - For finite outcomes with completion criteria (PREFER THIS OVER DIRECT TASKS)
+  - Example: "Hire Compliance Assurance Head", "Conduct Monday Elevated Priority meeting"
   - Has a clear end state: hired, launched, completed, shipped
+  - Link to parent responsibility if applicable
+
+**CreateTask** - For concrete actions WITHIN A GOAL
+  - ALWAYS link to parent goal via parentGoalId (except rare exceptions)
+  - Link to responsibilities via context.responsibilityId
+  - For cadences, include context.cadenceId
+  - Check recent tasks first to avoid duplicates
 
 **CreateResponsibility** - For ongoing areas of work without an end date
   - Example: "Weekly recruiting pipeline review", "Daily standup preparation"
@@ -255,11 +296,6 @@ Use the available MCP tools to create what's needed:
 **StoreContext** - To remember important context discovered
   - People involved, decisions made, requirements identified
   - Project details, processes, preferences
-
-**CreateTask** - For concrete actions to execute
-  - Link to parent goals via parentGoalId
-  - Link to responsibilities via context.responsibilityId
-  - For cadences, include context.cadenceId
 
 **UpdateGoal / UpdateResponsibility / UpdateTask** - To refine existing entities
   - Correct titles, descriptions, priorities
@@ -270,19 +306,17 @@ Use the available MCP tools to create what's needed:
   - Remove completed goals or ended responsibilities
 
 For completed tasks with findings, determine:
-- Should this be a Goal? (if findings reveal a finite objective to pursue)
-- Should this be a Responsibility? (if findings reveal ongoing work needed)
+- Should this create a new Goal? (if findings reveal a finite objective)
 - Should we store Context? (stakeholders, decisions, requirements discovered)
-- Should we create follow-up Tasks?
+- Should we create follow-up Tasks WITHIN THE GOAL?
 - Should we update or delete existing entities?
 
 Consider:
-- What's the most important thing to do right now?
-- What can be done autonomously vs what needs approval?
-- Are there any time-sensitive items?
-- For cadences, what specific actions are needed?
-- Do task findings reveal new goals or ongoing responsibilities?
-- Are there duplicates or obsolete items to clean up?
+- What specific outcome needs to be achieved? (Create Goal)
+- What actions are needed to achieve that outcome? (Create Tasks under Goal)
+- What ongoing work needs monitoring? (Create/update Responsibility)
+- Has similar work been done recently? (Check before creating)
+- Are there duplicates or obsolete items? (Delete them)
 
 Use the tools to create, update, or delete as needed. If nothing requires attention, simply don't use any tools.
 `;
