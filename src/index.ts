@@ -51,7 +51,8 @@ async function main(): Promise<void> {
   console.log(`  ${colors.dim('•')} Use ${colors.info('/status')} to check progress`);
   console.log(`  ${colors.dim('•')} Use ${colors.info('/approvals')} to see pending items`);
   console.log(`  ${colors.dim('•')} Use ${colors.info('/help')} for all commands`);
-  console.log(`  ${colors.dim('•')} Press ${colors.info('Tab')} for command completion\n`);
+  console.log(`  ${colors.dim('•')} Press ${colors.info('Tab')} for command completion`);
+  console.log(`  ${colors.dim('•')} Press ${colors.info('↑')} to inspect current task details\n`);
 
   // Tab completion function
   const completer = (line: string): [string[], string] => {

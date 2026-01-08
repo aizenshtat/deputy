@@ -1139,7 +1139,10 @@ export class Deputy {
 - \`/help\` - Show this help message
 
 ---
-*Tip: Press Tab after command names to see subcommand options!*`;
+**Tips:**
+- Press **Tab** after command names to see subcommand options
+- Press **↑** to quickly inspect current task details (when task is running)
+- Status bar at bottom shows: Current Task | Time | Latest Action`;
         return renderMarkdown(markdown);
       }
 
