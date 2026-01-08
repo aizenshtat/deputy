@@ -445,7 +445,7 @@ export class Deputy {
                 latestAction = `🔧 ${displayName}`;
                 this.taskQueue.addTaskLog(task.id, {
                   type: 'tool_use',
-                  message: `Using tool: ${toolName}`,
+                  message: `Using tool: \`${toolName}\``, // Wrap in backticks to preserve underscores
                   details: block.input
                 });
               }
