@@ -38,8 +38,8 @@ export class StatusBar {
     const rows = process.stdout.rows || 24;
     const cols = process.stdout.columns || 80;
 
-    // Move to bottom row
-    process.stdout.write(`\x1b[${rows};0H`);
+    // Move to second-to-last row (leave last row for readline input)
+    process.stdout.write(`\x1b[${rows - 1};0H`);
 
     // Clear the line
     process.stdout.write('\x1b[K');
@@ -68,8 +68,8 @@ export class StatusBar {
     // Get terminal size
     const rows = process.stdout.rows || 24;
 
-    // Move to bottom row
-    process.stdout.write(`\x1b[${rows};0H`);
+    // Move to second-to-last row (where status bar is)
+    process.stdout.write(`\x1b[${rows - 1};0H`);
 
     // Clear the line
     process.stdout.write('\x1b[K');
