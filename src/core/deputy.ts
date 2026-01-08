@@ -342,6 +342,9 @@ export class Deputy {
     const taskStartTime = Date.now();
     let latestAction = '';
 
+    // Track tool execution times
+    const toolStartTimes = new Map<string, number>();
+
     const updateStatusBar = () => {
       const elapsed = Math.floor((Date.now() - taskStartTime) / 1000);
       const statusText = formatTaskStatus({
@@ -438,14 +441,32 @@ export class Deputy {
               // Tool use
               if (block.type === 'tool_use' && block.name) {
                 const toolName = block.name;
+                const toolUseId = block.id;
+
+                // Track tool start time
+                if (toolUseId) {
+                  toolStartTimes.set(toolUseId, Date.now());
+                }
+
                 // Shorten MCP tool names for display
                 const displayName = toolName.startsWith('mcp__')
                   ? toolName.replace('mcp__chrome-devtools__', 'chrome:').replace('mcp__deputy-tools__', '')
                   : toolName;
                 latestAction = `🔧 ${displayName}`;
+
+                // Enhanced logging for Task tool (subagents)
+                let logMessage = `Using tool: \`${toolName}\``;
+                if (toolName === 'Task' && block.input) {
+                  const input = block.input as any;
+                  const subagentType = input.subagent_type || 'unknown';
+                  const description = input.description || '';
+                  const promptPreview = input.prompt ? input.prompt.slice(0, 100) : '';
+                  logMessage = `Spawning subagent: **${subagentType}** - ${description || promptPreview}`;
+                }
+
                 this.taskQueue.addTaskLog(task.id, {
                   type: 'tool_use',
-                  message: `Using tool: \`${toolName}\``, // Wrap in backticks to preserve underscores
+                  message: logMessage,
                   details: block.input
                 });
               }
@@ -460,10 +481,27 @@ export class Deputy {
             for (const block of apiMessage.content) {
               if (block.type === 'tool_result' && block.tool_use_id) {
                 const isError = block.is_error || false;
+                const toolUseId = block.tool_use_id;
+
+                // Calculate tool duration if we tracked the start time
+                let durationMsg = '';
+                if (toolStartTimes.has(toolUseId)) {
+                  const startTime = toolStartTimes.get(toolUseId)!;
+                  const duration = Math.round((Date.now() - startTime) / 1000);
+                  durationMsg = duration > 3 ? ` (${duration}s)` : '';
+                  toolStartTimes.delete(toolUseId);
+                }
+
                 if (isError) {
                   this.taskQueue.addTaskLog(task.id, {
                     type: 'error',
-                    message: `Tool failed`
+                    message: `Tool failed${durationMsg}`
+                  });
+                } else if (durationMsg) {
+                  // Only log successful completions if they took >3 seconds
+                  this.taskQueue.addTaskLog(task.id, {
+                    type: 'info',
+                    message: `Tool completed${durationMsg}`
                   });
                 }
               }
