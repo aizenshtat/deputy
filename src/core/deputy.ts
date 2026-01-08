@@ -97,7 +97,7 @@ export class Deputy {
         storeContext: (params) => this.storeContextFromParams(params),
       },
       mcpServerFactory: () => this.createDeputyTools(),
-      scanIntervalMs: 30 * 60 * 1000, // 30 minutes
+      scanIntervalMs: 4 * 60 * 60 * 1000, // 4 hours (was 30min - too frequent, causing duplicate task spam)
       model: this.config.model,
       cwd: this.config.workingDirectory,
     });

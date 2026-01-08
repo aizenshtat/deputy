@@ -66,6 +66,41 @@ export class SupervisionHook {
       return { needed: false, risk: 'low' };
     }
 
+    // Browser communication actions (sending messages, emails, etc.)
+    if (toolName.includes('chrome-devtools') || toolName.includes('browser')) {
+      const input = toolInput as any;
+
+      // Typing in message/email fields
+      if (toolName.includes('type') && input?.text) {
+        // Check if typing in messaging/email context (high risk if lengthy message)
+        if (input.text.length > 100) {
+          return { needed: true, reason: 'Composing message - requires approval before sending', risk: 'high' };
+        }
+      }
+
+      // Clicking send/submit buttons
+      if (toolName.includes('click')) {
+        const element = input?.element?.toLowerCase() || '';
+        if (element.includes('send') || element.includes('submit') || element.includes('post')) {
+          return { needed: true, reason: 'Sending message/email - requires explicit approval', risk: 'high' };
+        }
+      }
+
+      // Navigation to messaging platforms
+      if (toolName.includes('navigate') && input?.url) {
+        const url = input.url.toLowerCase();
+        if (url.includes('slack.com') || url.includes('mail.') || url.includes('gmail')) {
+          // Just navigation is safe, but flag for monitoring
+          return { needed: false, risk: 'low' };
+        }
+      }
+
+      // Browser actions are generally safe unless they're communication
+      if (this.config.requireApprovalFor.webActions) {
+        return { needed: true, reason: 'Web action requires approval', risk: 'low' };
+      }
+    }
+
     // Check block patterns for Bash
     if (toolName === 'Bash') {
       const command = (toolInput as { command?: string })?.command ?? '';
