@@ -25,6 +25,7 @@ import { getAgentDefinitions } from '../agents/index.js';
 import { buildSystemPrompt, buildTaskPrompt } from '../config/system-prompt.js';
 import { DeputyState, DeputyConfig, Task, ContextEntry } from '../types.js';
 import { colors, statusSymbols, renderMarkdown } from '../utils/colors.js';
+import { StatusBar, formatTaskStatus } from '../utils/status-bar.js';
 
 const DEFAULT_CONFIG: DeputyConfig = {
   workingDirectory: process.cwd(),
@@ -51,6 +52,7 @@ export class Deputy {
   private persistence: Persistence;
   private auditLog: AuditLog;
   private supervisionHook: SupervisionHook;
+  private statusBar: StatusBar;
 
   private state: DeputyState = {
     isRunning: false,
@@ -80,6 +82,7 @@ export class Deputy {
     this.persistence = new Persistence(this.config.dataDirectory);
     this.auditLog = new AuditLog(this.config.dataDirectory);
     this.supervisionHook = new SupervisionHook(this.approvalQueue, this.taskQueue);
+    this.statusBar = new StatusBar();
 
     // Initialize autonomous scanner
     this.autonomousScanner = new AutonomousScanner({
@@ -335,30 +338,22 @@ export class Deputy {
     this.supervisionHook.setCurrentTask(task.id);
     this.state.currentTaskId = task.id;
 
-    // Periodic status updates (non-intrusive)
+    // Status bar updates (streaming, non-intrusive)
     const taskStartTime = Date.now();
-    let lastToolUsed = '';
-    let lastThinking = '';
-    let lastText = '';
-    let statusInterval: NodeJS.Timeout | null = null;
+    let latestAction = '';
 
-    const showPeriodicStatus = () => {
+    const updateStatusBar = () => {
       const elapsed = Math.floor((Date.now() - taskStartTime) / 1000);
-      const mins = Math.floor(elapsed / 60);
-      const secs = elapsed % 60;
-      const timeStr = mins > 0 ? `${mins}m ${secs}s` : `${secs}s`;
-
-      let status = colors.dim(`  ⚙️ ${task.title.slice(0, 40)}${task.title.length > 40 ? '...' : ''}`);
-      if (lastToolUsed) {
-        status += colors.dim(` | Last: ${lastToolUsed}`);
-      }
-      status += colors.dim(` | ${timeStr} elapsed`);
-
-      console.log(status);
+      const statusText = formatTaskStatus({
+        taskTitle: task.title,
+        elapsedSeconds: elapsed,
+        latestAction,
+      });
+      this.statusBar.update(statusText);
     };
 
-    // Start periodic status updates every 20 seconds
-    statusInterval = setInterval(showPeriodicStatus, 20000);
+    // Update status bar continuously (throttled internally to prevent flicker)
+    const statusInterval = setInterval(updateStatusBar, 500);
 
     try {
       const systemPrompt = buildSystemPrompt({
@@ -420,7 +415,7 @@ export class Deputy {
               if (block.type === 'text' && block.text) {
                 const textContent = block.text;
                 if (textContent.trim()) {
-                  lastText = textContent.slice(0, 80);
+                  latestAction = `💭 ${textContent.slice(0, 50)}${textContent.length > 50 ? '...' : ''}`;
                   this.taskQueue.addTaskLog(task.id, {
                     type: 'info',
                     message: `Agent: ${textContent.slice(0, 200)}`
@@ -432,7 +427,7 @@ export class Deputy {
               if (block.type === 'thinking' && block.thinking) {
                 const thinking = block.thinking;
                 if (thinking.trim()) {
-                  lastThinking = thinking.slice(0, 80);
+                  latestAction = `🤔 ${thinking.slice(0, 50)}${thinking.length > 50 ? '...' : ''}`;
                   this.taskQueue.addTaskLog(task.id, {
                     type: 'thinking',
                     message: thinking.slice(0, 200)
@@ -447,7 +442,7 @@ export class Deputy {
                 const displayName = toolName.startsWith('mcp__')
                   ? toolName.replace('mcp__chrome-devtools__', 'chrome:').replace('mcp__deputy-tools__', '')
                   : toolName;
-                lastToolUsed = displayName;
+                latestAction = `🔧 ${displayName}`;
                 this.taskQueue.addTaskLog(task.id, {
                   type: 'tool_use',
                   message: `Using tool: ${toolName}`,
@@ -486,10 +481,11 @@ export class Deputy {
         }
       }
 
-      // Clear periodic status interval
+      // Clear periodic status interval and status bar
       if (statusInterval) {
         clearInterval(statusInterval);
       }
+      this.statusBar.clear();
 
       // Task completed successfully
       this.taskQueue.updateTaskStatus(task.id, 'completed', result);
@@ -505,10 +501,11 @@ export class Deputy {
         this.goalManager.updateProgress(task.parentGoalId, completed, goalTasks.length);
       }
     } catch (error) {
-      // Clear periodic status interval
+      // Clear periodic status interval and status bar
       if (statusInterval) {
         clearInterval(statusInterval);
       }
+      this.statusBar.clear();
 
       const errorMessage = error instanceof Error ? error.message : String(error);
 
