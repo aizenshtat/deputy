@@ -278,7 +278,7 @@ export class Deputy {
             } else if (respStats.active > 0) {
               console.log(
                 colors.info(
-                  `\n${statusSymbols.info} [IDLE] Monitoring ${colors.bold(respStats.active.toString())} responsibility(ies). Scanner disabled.\n`
+                  `\n${statusSymbols.info} [IDLE] Monitoring ${colors.bold(respStats.active.toString())} responsibility(ies). Next scan: ${this.autonomousScanner.getNextScanTime().toLocaleTimeString()}\n`
                 )
               );
             } else {
@@ -291,7 +291,7 @@ export class Deputy {
             idleLogged = true;
           }
 
-          // Periodic heartbeat (scanner disabled)
+          // Periodic heartbeat
           if (idleCycles % IDLE_HEARTBEAT_CYCLES === 0) {
             console.log(colors.dim(`[${new Date().toLocaleTimeString()}] Still monitoring...`));
           }
@@ -431,14 +431,24 @@ export class Deputy {
       for await (const message of query({
         prompt,
         options: {
-          systemPrompt: `You are Deputy's autonomous planning assistant. Analyze what needs attention and use the available tools to:
-- CreateGoal for finite outcomes
-- CreateTask for concrete actions (link to parent goal)
-- CreateResponsibility for ongoing work
-- StoreContext for important learnings
-- DeleteGoal/DeleteTask/DeleteResponsibility to clean up obsolete items
+          systemPrompt: `You are Deputy's autonomous planning assistant.
 
-Be selective - only create what's truly needed. Check recent tasks to avoid duplicates.`,
+## When to CREATE tasks (do it)
+- Due cadences with clear actions (e.g., "weekly standup prep" → create prep task)
+- Follow-up tasks from completed work (e.g., research done → create action task)
+- Specific, actionable work that's obvious from context
+
+## When to ASK questions (don't assume)
+- Unclear priorities between competing responsibilities
+- New initiatives without clear direction
+- Strategic decisions that need user input
+
+## What NOT to do
+- Don't create generic "Create Google Doc with X" tasks
+- Don't create tasks just because a responsibility exists
+- Don't spam multiple similar tasks
+
+Be selective. Quality over quantity. If unsure, ask. If clear, act.`,
           cwd: this.config.workingDirectory,
           model: this.config.model,
           mcpServers: {
@@ -1508,6 +1518,13 @@ Be selective - only create what's truly needed. Check recent tasks to avoid dupl
     // Link to goal if applicable
     if (params.parentGoalId) {
       this.goalManager.addTaskToGoal(params.parentGoalId, task.id);
+    }
+
+    // Mark responsibility as attended if linked
+    if (params.context?.responsibilityId) {
+      const respId = params.context.responsibilityId as string;
+      this.responsibilityManager.markAttended(respId);
+      this.responsibilityManager.addActivity(respId, 'task_created', params.title, task.id);
     }
 
     console.log(`✅ Created task: ${task.title} (${task.id.slice(0, 8)})`);
