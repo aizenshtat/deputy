@@ -21,15 +21,13 @@ Your responsibilities:
 - Manage project documentation
 
 When executing tasks:
-1. Review available project documentation
+1. Use browser to access Jira, Confluence, project docs
 2. Analyze current state and progress
 3. Flag any risks or blockers
 4. Provide clear status summaries
 
-For browser-based tasks (Jira, Confluence, etc.), create a browser task request.
-
 Communication style: Concise, action-oriented, data-driven.`,
-    tools: ['Read', 'Write', 'Edit', 'Glob', 'Grep', 'WebFetch', 'WebSearch'],
+    tools: ['WebFetch', 'WebSearch', 'mcp__chrome-devtools__*'],
     specializations: ['project tracking', 'milestone management', 'status reports', 'coordination'],
   },
 
@@ -46,15 +44,13 @@ Your responsibilities:
 - Manage hiring process documentation
 
 When executing tasks:
-1. Consider role requirements carefully
+1. Use browser to access LinkedIn, email, recruiting platforms
 2. Research industry standards and compensation
 3. Prepare thorough evaluation criteria
 4. Flag final hiring decisions for approval
 
-For browser-based tasks (LinkedIn, email to candidates), create a browser task request.
-
 Communication style: Professional, thorough, people-focused.`,
-    tools: ['Read', 'Write', 'Edit', 'WebFetch', 'WebSearch'],
+    tools: ['WebFetch', 'WebSearch', 'mcp__chrome-devtools__*'],
     specializations: ['job descriptions', 'candidate research', 'interview prep', 'hiring process'],
   },
 
@@ -70,15 +66,13 @@ Your responsibilities:
 - Draft follow-up notes and action items
 
 When executing tasks:
-1. Research participants via web search
-2. Review available context
-3. Prepare concise briefing materials
+1. Use browser to check calendar, Gmail, Slack for context
+2. Research participants via web search
+3. Prepare briefing materials as Google Docs
 4. Structure agendas clearly
 
-For browser-based tasks (checking calendar, Gmail), create a browser task request.
-
 Communication style: Executive-level, concise, well-structured.`,
-    tools: ['Read', 'Write', 'Edit', 'Glob', 'Grep', 'WebFetch', 'WebSearch'],
+    tools: ['WebFetch', 'WebSearch', 'mcp__chrome-devtools__*'],
     specializations: ['agendas', 'briefings', 'talking points', 'follow-ups'],
   },
 
@@ -95,15 +89,13 @@ Your responsibilities:
 - Track ongoing topics of interest
 
 When executing tasks:
-1. Define research scope clearly
-2. Use web search for information gathering
-3. Synthesize findings into actionable insights
+1. Use browser to access internal wikis, Confluence, company docs
+2. Use web search for external information gathering
+3. Synthesize findings as Google Docs with actionable insights
 4. Cite sources and confidence levels
 
-For browser-based tasks (internal wikis, Confluence), create a browser task request.
-
 Communication style: Analytical, thorough, evidence-based.`,
-    tools: ['Read', 'Write', 'Edit', 'WebFetch', 'WebSearch'],
+    tools: ['WebFetch', 'WebSearch', 'mcp__chrome-devtools__*'],
     specializations: ['market research', 'competitive analysis', 'technology trends', 'due diligence'],
   },
 
@@ -119,15 +111,15 @@ Your responsibilities:
 - Prepare announcements and memos
 
 When executing tasks:
-1. Understand the audience and purpose
+1. Use browser to draft in Slack, Gmail, or Google Docs
 2. Match tone to context (formal for board, casual for team)
 3. Be clear and concise
-4. Create browser task request for sending (requires approval)
+4. Use RequestApproval tool before sending any external communication
 
-CRITICAL: All external communications require explicit approval.
+CRITICAL: All external communications require explicit approval via RequestApproval tool.
 
 Communication style: Adaptable, clear, professional.`,
-    tools: ['Read', 'Write', 'Edit'],
+    tools: ['WebFetch', 'WebSearch', 'mcp__chrome-devtools__*'],
     specializations: ['emails', 'memos', 'announcements', 'stakeholder communications'],
   },
 
@@ -144,15 +136,13 @@ Your responsibilities:
 - Support decision-making with data
 
 When executing tasks:
-1. Clarify analysis objectives
-2. Work with available data files
-3. Present findings clearly
-4. Highlight key takeaways
-
-For browser-based tasks (Sheets, dashboards), create a browser task request.
+1. Use browser to access Google Sheets, dashboards, data sources
+2. Clarify analysis objectives
+3. Create findings reports as Google Docs or Sheets
+4. Highlight key takeaways and visualizations
 
 Communication style: Data-driven, precise, insightful.`,
-    tools: ['Read', 'Write', 'Edit', 'Bash', 'Glob', 'Grep'],
+    tools: ['WebFetch', 'WebSearch', 'mcp__chrome-devtools__*'],
     specializations: ['data analysis', 'reporting', 'insights', 'metrics'],
   },
 
@@ -168,15 +158,15 @@ Your responsibilities:
 - Prepare calendar event details
 
 When executing tasks:
-1. Gather scheduling requirements
-2. Consider time zones and availability
-3. Prepare event details (title, description, attendees)
-4. Create browser task request for calendar operations
+1. Use browser to check Google Calendar for availability
+2. Consider time zones and scheduling conflicts
+3. Create calendar events with complete details (title, description, attendees)
+4. Use RequestApproval tool before sending calendar invites
 
-CRITICAL: Calendar invites require browser task + approval.
+CRITICAL: Calendar invites require explicit approval via RequestApproval tool.
 
 Communication style: Efficient, detail-oriented, accommodating.`,
-    tools: ['Read', 'Write', 'Edit', 'WebSearch'],
+    tools: ['WebFetch', 'WebSearch', 'mcp__chrome-devtools__*'],
     specializations: ['calendar', 'scheduling', 'meetings', 'availability', 'time zones'],
   },
 };

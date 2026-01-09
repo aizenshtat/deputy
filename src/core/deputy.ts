@@ -22,6 +22,7 @@ import { Persistence, PersistedData } from '../memory/persistence.js';
 import { AuditLog } from '../hooks/audit-log.js';
 import { SupervisionHook } from '../hooks/supervision.js';
 import { getAgentDefinitions } from '../agents/index.js';
+import { ApprovalRequest } from '../types.js';
 import { buildSystemPrompt, buildTaskPrompt } from '../config/system-prompt.js';
 import { DeputyState, DeputyConfig, Task, ContextEntry } from '../types.js';
 import { colors, statusSymbols, renderMarkdown } from '../utils/colors.js';
@@ -84,22 +85,13 @@ export class Deputy {
     this.supervisionHook = new SupervisionHook(this.approvalQueue, this.taskQueue);
     this.statusBar = new StatusBar();
 
-    // Initialize autonomous scanner
+    // Initialize autonomous scanner (planning now done inline in deputy.ts)
     this.autonomousScanner = new AutonomousScanner({
       responsibilityManager: this.responsibilityManager,
       taskQueue: this.taskQueue,
       contextStore: this.contextStore,
       goalManager: this.goalManager,
-      creationCallbacks: {
-        createGoal: (params) => this.createGoalFromParams(params),
-        createResponsibility: (params) => this.createResponsibilityFromParams(params),
-        createTask: (params) => this.createTaskFromParams(params),
-        storeContext: (params) => this.storeContextFromParams(params),
-      },
-      mcpServerFactory: () => this.createDeputyTools(),
-      scanIntervalMs: 4 * 60 * 60 * 1000, // 4 hours (was 30min - too frequent, causing duplicate task spam)
-      model: this.config.model,
-      cwd: this.config.workingDirectory,
+      scanIntervalMs: 30 * 60 * 1000, // 30 minutes
     });
 
     // Set up change listeners for auto-save
@@ -131,6 +123,9 @@ export class Deputy {
 
       // Restore session ID for conversation continuity (enables task resumption)
       this.currentSessionId = data.state.sessionId;
+
+      // Detect and recover stuck tasks
+      this.recoverStuckTasks();
 
       // Report if there's a task to resume
       if (this.state.currentTaskId) {
@@ -166,16 +161,7 @@ export class Deputy {
         taskQueue: this.taskQueue,
         contextStore: this.contextStore,
         goalManager: this.goalManager,
-        creationCallbacks: {
-          createGoal: (params) => this.createGoalFromParams(params),
-          createResponsibility: (params) => this.createResponsibilityFromParams(params),
-          createTask: (params) => this.createTaskFromParams(params),
-          storeContext: (params) => this.storeContextFromParams(params),
-        },
-        mcpServerFactory: () => this.createDeputyTools(),
-        scanIntervalMs: 30 * 60 * 1000,
-        model: this.config.model,
-        cwd: this.config.workingDirectory,
+        scanIntervalMs: 30 * 60 * 1000, // 30 minutes
       });
 
       console.log('Restored state from disk');
@@ -258,57 +244,58 @@ export class Deputy {
           }
         }
 
+        // Priority 4: Handle rejected approvals (learn from rejections)
+        if (!taskToExecute) {
+          await this.handleRejectedApprovals();
+        }
+
         if (taskToExecute) {
           idleLogged = false;
           idleCycles = 0;
           await this.executeTask(taskToExecute);
         } else {
-            // Idle - run autonomous scanner if it's time
-            if (this.autonomousScanner.shouldScan()) {
-              idleLogged = false;
-              idleCycles = 0;
-              await this.autonomousScanner.scan();
-            } else {
-              idleCycles++;
-
-              // First idle message
-              if (!idleLogged) {
-                const stats = this.taskQueue.getStats();
-                const approvals = this.approvalQueue.getStats();
-                const respStats = this.responsibilityManager.getStats();
-                const nextScan = this.autonomousScanner.getNextScanTime();
-                const minsToScan = Math.max(0, Math.round((nextScan.getTime() - Date.now()) / 60000));
-
-                if (stats.waitingApproval > 0 || approvals.pending > 0) {
-                  console.log(
-                    colors.warning(
-                      `\n${statusSymbols.warning} [IDLE] Waiting for ${colors.bold(approvals.pending.toString())} approval(s). Use ${colors.info('/approvals')} to review.\n`
-                    )
-                  );
-                } else if (respStats.active > 0) {
-                  console.log(
-                    colors.info(
-                      `\n${statusSymbols.info} [IDLE] Monitoring ${colors.bold(respStats.active.toString())} responsibility(ies). Next scan in ${colors.bold(minsToScan + 'm')}.\n`
-                    )
-                  );
-                } else {
-                  console.log(
-                    colors.dim(
-                      `\n${statusSymbols.pending} [IDLE] No tasks or responsibilities. Use ${colors.info('/responsibility')} to add ongoing work.\n`
-                    )
-                  );
-                }
-                idleLogged = true;
-              }
-
-              // Periodic heartbeat
-              if (idleCycles % IDLE_HEARTBEAT_CYCLES === 0) {
-                const nextScan = this.autonomousScanner.getNextScanTime();
-                const minsToScan = Math.max(0, Math.round((nextScan.getTime() - Date.now()) / 60000));
-                console.log(colors.dim(`[${new Date().toLocaleTimeString()}] Still monitoring... Next scan in ${minsToScan}m`));
-              }
-            }
+          // Check if it's time to plan (scanner logic moved inline)
+          if (this.autonomousScanner.shouldScan()) {
+            idleLogged = false;
+            idleCycles = 0;
+            await this.planNewWork();
           }
+
+          idleCycles++;
+
+          // First idle message
+          if (!idleLogged) {
+            const stats = this.taskQueue.getStats();
+            const approvals = this.approvalQueue.getStats();
+            const respStats = this.responsibilityManager.getStats();
+
+            if (stats.waitingApproval > 0 || approvals.pending > 0) {
+              console.log(
+                colors.warning(
+                  `\n${statusSymbols.warning} [IDLE] Waiting for ${colors.bold(approvals.pending.toString())} approval(s). Use ${colors.info('/approvals')} to review.\n`
+                )
+              );
+            } else if (respStats.active > 0) {
+              console.log(
+                colors.info(
+                  `\n${statusSymbols.info} [IDLE] Monitoring ${colors.bold(respStats.active.toString())} responsibility(ies). Scanner disabled.\n`
+                )
+              );
+            } else {
+              console.log(
+                colors.dim(
+                  `\n${statusSymbols.pending} [IDLE] No tasks or responsibilities. Use ${colors.info('/responsibility')} to add ongoing work.\n`
+                )
+              );
+            }
+            idleLogged = true;
+          }
+
+          // Periodic heartbeat (scanner disabled)
+          if (idleCycles % IDLE_HEARTBEAT_CYCLES === 0) {
+            console.log(colors.dim(`[${new Date().toLocaleTimeString()}] Still monitoring...`));
+          }
+        }
 
         // Update stats
         this.updateStats();
@@ -320,6 +307,175 @@ export class Deputy {
         await this.sleep(this.config.pollingIntervalMs);
       }
     }
+  }
+
+  /**
+   * Detect and recover stuck tasks on startup
+   * A task is stuck if it's been in_progress for >10 minutes with no updates
+   * Also auto-retry failed tasks caused by tool errors
+   */
+  private recoverStuckTasks(): void {
+    const STUCK_THRESHOLD_MS = 10 * 60 * 1000; // 10 minutes
+    const now = Date.now();
+
+    // Handle stuck in_progress tasks
+    const inProgressTasks = this.taskQueue.getTasksByStatus('in_progress');
+
+    for (const task of inProgressTasks) {
+      const timeSinceUpdate = now - task.updatedAt.getTime();
+
+      if (timeSinceUpdate > STUCK_THRESHOLD_MS) {
+        console.log(colors.warning(`\n⚠️  Detected stuck task: ${colors.bold(task.title)} (${task.id.slice(0, 8)})`));
+        console.log(colors.dim(`   Last updated: ${Math.round(timeSinceUpdate / 60000)} minutes ago`));
+
+        // Clear the session ID to force a fresh start
+        if (this.currentSessionId && this.state.currentTaskId === task.id) {
+          console.log(colors.info(`   Restarting task with fresh session...\n`));
+          this.currentSessionId = undefined;
+          this.state.sessionId = undefined;
+        } else {
+          // Not the current task, reset it to pending
+          console.log(colors.info(`   Resetting task to pending...\n`));
+          this.taskQueue.updateTaskStatus(task.id, 'pending');
+        }
+
+        // Add a log entry about the recovery
+        this.taskQueue.addTaskLog(task.id, {
+          type: 'info',
+          message: `⚠️ Task was stuck (no activity for ${Math.round(timeSinceUpdate / 60000)} minutes). Auto-restarted with fresh session.`
+        });
+      }
+    }
+
+    // Handle failed tasks that can be auto-retried (tool errors that might be fixed now)
+    const failedTasks = this.taskQueue.getTasksByStatus('failed');
+
+    for (const task of failedTasks) {
+      if (task.error && task.error.includes('Tool error:')) {
+        console.log(colors.info(`\n🔄 Auto-retrying failed task (tool error fixed): ${colors.bold(task.title)} (${task.id.slice(0, 8)})`));
+        this.taskQueue.updateTaskStatus(task.id, 'pending');
+        this.taskQueue.addTaskLog(task.id, {
+          type: 'info',
+          message: 'Auto-retrying task after tool availability was restored'
+        });
+      }
+    }
+  }
+
+  /**
+   * Handle rejected approvals - fail tasks and learn from rejection reasoning
+   */
+  private async handleRejectedApprovals(): Promise<void> {
+    // Get all rejected approvals
+    const rejectedApprovals = this.approvalQueue.getAllApprovals().filter((a: ApprovalRequest) => a.status === 'rejected');
+
+    for (const approval of rejectedApprovals) {
+      // Find the task associated with this approval
+      const task = this.taskQueue.getAllTasks().find(t =>
+        t.status === 'waiting_approval' &&
+        (t.approvalId === approval.id || t.id === approval.taskId)
+      );
+
+      if (task) {
+        console.log(colors.warning(`\n⚠️  Handling rejected approval for task: ${colors.bold(task.title)} (${task.id.slice(0, 8)})`));
+        console.log(colors.dim(`   Rejection reason: ${approval.rejectionReason}`));
+
+        // Store the rejection as context (learning)
+        this.contextStore.upsert({
+          category: 'decision',
+          key: `rejection_${task.id.slice(0, 8)}_${Date.now()}`,
+          value: `Rejected task "${task.title}": ${approval.rejectionReason}`,
+          source: 'user_rejection',
+          tags: ['rejection', 'learning'],
+          confidence: 0.9
+        });
+
+        // Fail the task with the rejection reason
+        this.taskQueue.updateTaskStatus(
+          task.id,
+          'failed',
+          undefined,
+          `Rejected by user: ${approval.rejectionReason}`
+        );
+
+        this.taskQueue.addTaskLog(task.id, {
+          type: 'error',
+          message: `Task rejected by user: ${approval.rejectionReason}`
+        });
+
+        console.log(colors.info(`   Stored rejection reasoning as context for future learning\n`));
+      }
+
+      // Remove the processed rejection
+      this.approvalQueue.deleteApproval(approval.id);
+    }
+  }
+
+  /**
+   * Plan new work - runs inline (no subprocess) to avoid MCP communication issues
+   */
+  private async planNewWork(): Promise<void> {
+    console.log('[SCAN] Starting autonomous planning...');
+
+    const prompt = this.autonomousScanner.buildPlanningPrompt();
+
+    // If nothing to plan, skip
+    if (!prompt) {
+      console.log('[SCAN] Nothing needs attention');
+      this.autonomousScanner.markScanned();
+      return;
+    }
+
+    try {
+      // Use same query() as task execution - works because same process
+      for await (const message of query({
+        prompt,
+        options: {
+          systemPrompt: `You are Deputy's autonomous planning assistant. Analyze what needs attention and use the available tools to:
+- CreateGoal for finite outcomes
+- CreateTask for concrete actions (link to parent goal)
+- CreateResponsibility for ongoing work
+- StoreContext for important learnings
+- DeleteGoal/DeleteTask/DeleteResponsibility to clean up obsolete items
+
+Be selective - only create what's truly needed. Check recent tasks to avoid duplicates.`,
+          cwd: this.config.workingDirectory,
+          model: this.config.model,
+          mcpServers: {
+            "deputy-tools": this.createDeputyTools()
+          },
+          allowedTools: [
+            'mcp__deputy-tools__*', // All deputy tools for planning
+            'WebFetch', 'WebSearch', // Research capabilities
+          ],
+        },
+      })) {
+        // Log scanner activity
+        if (message.type === 'assistant' && 'message' in message) {
+          const apiMessage = message.message as any;
+
+          if (apiMessage.content && Array.isArray(apiMessage.content)) {
+            for (const block of apiMessage.content) {
+              if (block.type === 'text' && block.text) {
+                console.log(`[SCAN] 💭 ${block.text.slice(0, 150)}${block.text.length > 150 ? '...' : ''}`);
+              }
+              if (block.type === 'thinking' && block.thinking) {
+                console.log(`[SCAN] 🤔 ${block.thinking.slice(0, 150)}${block.thinking.length > 150 ? '...' : ''}`);
+              }
+              if (block.type === 'tool_use' && block.name) {
+                console.log(`[SCAN] 🔧 Using: ${block.name}`);
+              }
+            }
+          }
+        }
+      }
+
+      console.log('[SCAN] Planning complete');
+    } catch (error) {
+      console.error('[SCAN] Error during planning:', error);
+    }
+
+    this.autonomousScanner.markScanned();
   }
 
   /**
@@ -438,9 +594,13 @@ export class Deputy {
             "deputy-tools": this.createDeputyTools()
           },
           allowedTools: [
-            'Read', 'Write', 'Edit', 'Bash', 'Glob', 'Grep', 'WebFetch', 'WebSearch', 'Task',
+            // Web research and delegation
+            'WebFetch', 'WebSearch', 'Task',
+            // Browser automation (Google Docs/Sheets/Slack/Gmail/etc.)
             'mcp__chrome-devtools__*', // Wildcard: allow all chrome-devtools MCP tools
+            // Deputy custom tools (goals, tasks, approvals, context, responsibilities)
             'mcp__deputy-tools__*', // Wildcard: allow all deputy learning tools
+            // NOTE: All filesystem tools removed (Read/Write/Edit/Grep/Glob/Bash) - executive assistant works in browser only
           ],
           agents: getAgentDefinitions(),
           resume: this.currentSessionId,
@@ -621,6 +781,12 @@ export class Deputy {
       if (errorMessage.includes('Pending approval')) {
         console.log(colors.warning(`${statusSymbols.warning} Task waiting for approval: ${colors.bold(task.title)}`));
         // Task is already marked as waiting_approval by the hook
+      } else if (errorMessage.toLowerCase().includes('tool') && (errorMessage.includes('not found') || errorMessage.includes('not allowed'))) {
+        // Tool availability error - likely trying to use removed tools
+        this.taskQueue.updateTaskStatus(task.id, 'failed', undefined, `Tool error: ${errorMessage}`);
+        console.error(colors.error(`${statusSymbols.failed} Task failed (tool unavailable): ${colors.bold(task.title)}`));
+        console.log(colors.dim(`   ${errorMessage.slice(0, 200)}`));
+        console.log(colors.info(`   Tip: Task will restart with fresh session on next Deputy start\n`));
       } else {
         this.taskQueue.updateTaskStatus(task.id, 'failed', undefined, errorMessage);
         console.error(colors.error(`${statusSymbols.failed} Task failed: ${colors.bold(task.title)}`), error);
@@ -1194,8 +1360,8 @@ export class Deputy {
       }
 
       case 'scan':
-        this.autonomousScanner.forceScan().catch(console.error);
-        return 'Forcing autonomous scan...';
+        this.autonomousScanner.forceScan();
+        return 'Autonomous scan will run on next idle cycle...';
 
       case 'help': {
         const markdown = `# Deputy Commands
@@ -2030,6 +2196,43 @@ ${domainList}
             this.taskQueue.updateTask(taskId, { context: updatedContext });
 
             return { content: [{ type: "text" as const, text: "Task context updated" }] };
+          }
+        ),
+
+        tool(
+          "RequestApproval",
+          "Request user approval for a specific action. Use this when you need explicit approval before proceeding (e.g., sending messages, making changes). This creates an approval request that user can review via /approvals.",
+          {
+            title: z.string().describe("Brief title of what needs approval (e.g., 'Send CEO message about recruitment')"),
+            description: z.string().describe("Detailed description of what you want to do and why"),
+            proposedAction: z.string().describe("The specific action you'll take if approved (e.g., 'Send Slack message to Alexey with recruitment briefing')"),
+            risk: z.enum(["low", "medium", "high"]).optional().default("medium").describe("Risk level of the action"),
+            details: z.record(z.string(), z.unknown()).optional().describe("Additional details (message content, etc.)")
+          },
+          async (args) => {
+            const approval = this.approvalQueue.requestApproval({
+              taskId: this.state.currentTaskId ?? 'direct-request',
+              type: 'action',
+              title: args.title,
+              description: args.description,
+              proposedAction: args.proposedAction,
+              risk: args.risk ?? 'medium',
+              details: args.details ?? {}
+            });
+
+            // Update task status if there's an active task
+            if (this.state.currentTaskId) {
+              this.taskQueue.setTaskApproval(this.state.currentTaskId, approval.id);
+            }
+
+            console.log(`📋 Approval requested: ${args.title} (${approval.id.slice(0, 8)})`);
+
+            return {
+              content: [{
+                type: "text" as const,
+                text: `Approval request created: ${approval.id}\n\nUser can review and approve via /approvals command.\n\nWhen approved, proceed with: ${args.proposedAction}`
+              }]
+            };
           }
         )
       ]

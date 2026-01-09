@@ -1,26 +1,18 @@
 /**
- * Autonomous Scanner - Proactively identifies work that needs to be done
+ * Autonomous Scanner - Utility class for planning timing and prompt building
  *
- * Runs when the agent is idle and:
- * 1. Checks for due cadences (daily standups, weekly preps, etc.)
- * 2. Reviews responsibilities needing attention
- * 3. Uses LLM to determine what tasks should be created
+ * Planning execution is now handled inline in deputy.ts to avoid subprocess issues.
+ * This class provides:
+ * 1. Timing logic (shouldScan, getNextScanTime)
+ * 2. Prompt building (buildPlanningPrompt)
  */
 
-import { query } from '@anthropic-ai/claude-agent-sdk';
 import { ResponsibilityManager, Responsibility, Cadence } from '../memory/responsibilities.js';
 import { TaskQueue } from './task-queue.js';
 import { ContextStore } from '../memory/context-store.js';
 import { GoalManager } from '../memory/goals.js';
 
-export interface ScanResult {
-  scannedAt: Date;
-  dueCadences: Array<{ responsibility: Responsibility; cadence: Cadence }>;
-  needingAttention: Responsibility[];
-  tasksCreated: number;
-  nextScanAt: Date;
-}
-
+// Type kept for backward compatibility with deputy.ts constructor
 export interface CreationCallbacks {
   createGoal: (params: { title: string; description: string; priority?: 'critical' | 'high' | 'medium' | 'low' }) => { id: string; title: string };
   createResponsibility: (params: { name: string; domain: string; description: string }) => { id: string; name: string };
@@ -33,13 +25,9 @@ export class AutonomousScanner {
   private taskQueue: TaskQueue;
   private contextStore: ContextStore;
   private goalManager: GoalManager;
-  private creationCallbacks: CreationCallbacks;
-  private mcpServerFactory: () => any;
 
   private lastScanAt: Date | null = null;
   private scanIntervalMs: number;
-  private model?: string;
-  private cwd: string;
   private startedAt: Date;
 
   constructor(params: {
@@ -47,9 +35,11 @@ export class AutonomousScanner {
     taskQueue: TaskQueue;
     contextStore: ContextStore;
     goalManager: GoalManager;
-    creationCallbacks: CreationCallbacks;
-    mcpServerFactory: () => any;
     scanIntervalMs?: number;
+    // Legacy params kept for backward compatibility (not used)
+    creationCallbacks?: any;
+    mcpServerFactory?: any;
+    sendChatMessage?: any;
     model?: string;
     cwd?: string;
   }) {
@@ -57,11 +47,7 @@ export class AutonomousScanner {
     this.taskQueue = params.taskQueue;
     this.contextStore = params.contextStore;
     this.goalManager = params.goalManager;
-    this.creationCallbacks = params.creationCallbacks;
-    this.mcpServerFactory = params.mcpServerFactory;
     this.scanIntervalMs = params.scanIntervalMs ?? 30 * 60 * 1000; // 30 min default
-    this.model = params.model;
-    this.cwd = params.cwd ?? process.cwd();
     this.startedAt = new Date();
   }
 
@@ -85,23 +71,22 @@ export class AutonomousScanner {
   }
 
   /**
-   * Run the autonomous scan
+   * Mark that a scan was performed (called by deputy.ts after inline planning)
    */
-  async scan(): Promise<ScanResult> {
-    console.log('[SCAN] Starting autonomous scan...');
+  markScanned(): void {
     this.lastScanAt = new Date();
+  }
 
+  /**
+   * Build the prompt for the LLM planner
+   * Returns null if nothing needs attention
+   */
+  buildPlanningPrompt(): string | null {
     // 1. Get due cadences
     const dueCadences = this.responsibilityManager.getDueCadences();
-    if (dueCadences.length > 0) {
-      console.log(`[SCAN] Found ${dueCadences.length} due cadence(s)`);
-    }
 
     // 2. Get responsibilities needing attention
     const needingAttention = this.responsibilityManager.getNeedingAttention(24);
-    if (needingAttention.length > 0) {
-      console.log(`[SCAN] Found ${needingAttention.length} responsibility(ies) needing attention`);
-    }
 
     // 3. Get active goals without tasks
     const goalsWithoutTasks = this.goalManager.getActiveGoals().filter(
@@ -112,11 +97,10 @@ export class AutonomousScanner {
     const recentlyCompletedTasks = this.taskQueue.getAllTasks()
       .filter((t) => t.status === 'completed' && t.result)
       .filter((t) => {
-        // Only tasks completed in last 48 hours
         const hoursSinceComplete = (Date.now() - t.updatedAt.getTime()) / (1000 * 60 * 60);
         return hoursSinceComplete <= 48;
       })
-      .slice(0, 10); // Limit to 10 most recent
+      .slice(0, 10);
 
     // 5. Get ALL recent tasks (last 72 hours) to avoid creating duplicates
     const recentTasks = this.taskQueue.getAllTasks()
@@ -125,59 +109,12 @@ export class AutonomousScanner {
         return hoursSinceUpdate <= 72;
       })
       .sort((a, b) => b.updatedAt.getTime() - a.updatedAt.getTime())
-      .slice(0, 30); // Limit to 30 most recent
+      .slice(0, 30);
 
-    // If nothing needs attention, skip LLM call
+    // If nothing needs attention, return null
     if (dueCadences.length === 0 && needingAttention.length === 0 && goalsWithoutTasks.length === 0 && recentlyCompletedTasks.length === 0) {
-      console.log('[SCAN] Nothing needs attention');
-      return {
-        scannedAt: this.lastScanAt,
-        dueCadences: [],
-        needingAttention: [],
-        tasksCreated: 0,
-        nextScanAt: this.getNextScanTime(),
-      };
+      return null;
     }
-
-    // 6. Build context for LLM
-    const planningPrompt = this.buildPlanningPrompt(dueCadences, needingAttention, goalsWithoutTasks, recentlyCompletedTasks, recentTasks);
-
-    // 6. Invoke LLM with MCP tools - it will create goals, responsibilities, tasks, and context as needed
-    let tasksCreated = 0;
-    try {
-      const stats = await this.planActions(planningPrompt);
-      tasksCreated = stats.tasksCreated;
-
-      console.log('[SCAN] Created:');
-      if (stats.goalsCreated > 0) console.log(`  - ${stats.goalsCreated} goal(s)`);
-      if (stats.responsibilitiesCreated > 0) console.log(`  - ${stats.responsibilitiesCreated} responsibility(ies)`);
-      if (stats.tasksCreated > 0) console.log(`  - ${stats.tasksCreated} task(s)`);
-      if (stats.contextStored > 0) console.log(`  - ${stats.contextStored} context item(s)`);
-    } catch (error) {
-      console.error('[SCAN] Error planning actions:', error);
-    }
-
-    console.log(`[SCAN] Complete.`);
-
-    return {
-      scannedAt: this.lastScanAt,
-      dueCadences,
-      needingAttention,
-      tasksCreated,
-      nextScanAt: this.getNextScanTime(),
-    };
-  }
-
-  /**
-   * Build the prompt for the LLM planner
-   */
-  private buildPlanningPrompt(
-    dueCadences: Array<{ responsibility: Responsibility; cadence: Cadence }>,
-    needingAttention: Responsibility[],
-    goalsWithoutTasks: Array<{ id: string; title: string; description: string }>,
-    recentlyCompletedTasks: Array<{ id: string; title: string; description: string; result?: string; context?: Record<string, unknown> }>,
-    recentTasks: Array<{ id: string; title: string; description: string; status: string; updatedAt: Date }>
-  ): string {
     const now = new Date();
     const dayOfWeek = ['Sunday', 'Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday', 'Saturday'][now.getDay()];
 
@@ -262,12 +199,20 @@ You are Deputy, an autonomous executive assistant. Review the following and dete
 
     prompt += `## Instructions
 
+**CRITICAL: You work in the browser, NOT with local files**
+- NEVER create tasks about .md files or local documents
+- ALL documents must be Google Docs, Sheets, or Slides created via browser
+- ALL emails must be Gmail drafts created via browser
+- Tasks should specify "Create Google Doc" not "Create document"
+- Example GOOD task: "Create Google Doc with recruitment strategy"
+- Example BAD task: "Create recruitment_strategy.md file"
+
 **IMPORTANT HIERARCHY - Follow this order:**
 
 1. **Responsibility → Goal → Tasks** (preferred flow)
    - Responsibility: Ongoing area (e.g., "Elevated Priority meetings")
    - Goal: Specific outcome (e.g., "Conduct Jan 13 Elevated Priority meeting")
-   - Tasks: Concrete actions (e.g., "Prepare agenda", "Create slides", "Send follow-ups")
+   - Tasks: Concrete actions (e.g., "Create Google Doc with agenda", "Compose Gmail draft to team")
 
 2. **AVOID creating standalone Tasks** - Tasks should almost always have a parent Goal
    - Exception: Quick context-gathering tasks directly for a Responsibility
@@ -325,95 +270,10 @@ Use the tools to create, update, or delete as needed. If nothing requires attent
   }
 
   /**
-   * Call LLM with MCP tools - Claude invokes tools directly
-   * Uses the same deputy-tools MCP server as task execution for consistency
+   * Force a scan regardless of interval (resets timer)
    */
-  private async planActions(prompt: string): Promise<{
-    tasksCreated: number;
-    goalsCreated: number;
-    responsibilitiesCreated: number;
-    contextStored: number;
-  }> {
-    // Track what gets created via callbacks
-    let goalsCreated = 0;
-    let responsibilitiesCreated = 0;
-    let contextStored = 0;
-    let tasksCreated = 0;
-
-    // Wrap callbacks to count invocations
-    const countingCallbacks: CreationCallbacks = {
-      createGoal: (params) => {
-        goalsCreated++;
-        return this.creationCallbacks.createGoal(params);
-      },
-      createResponsibility: (params) => {
-        responsibilitiesCreated++;
-        return this.creationCallbacks.createResponsibility(params);
-      },
-      createTask: (params) => {
-        tasksCreated++;
-        const result = this.creationCallbacks.createTask(params);
-
-        // Mark cadence as triggered if applicable
-        if (params.context?.responsibilityId && params.context?.cadenceId) {
-          this.responsibilityManager.triggerCadence(
-            params.context.responsibilityId as string,
-            params.context.cadenceId as string
-          );
-        }
-
-        // Mark responsibility as attended
-        if (params.context?.responsibilityId) {
-          const respId = params.context.responsibilityId as string;
-          this.responsibilityManager.markAttended(respId);
-          this.responsibilityManager.addActivity(respId, 'task_created', params.title, result.id);
-        }
-
-        return result;
-      },
-      storeContext: (params) => {
-        contextStored++;
-        return this.creationCallbacks.storeContext(params);
-      },
-    };
-
-    // Temporarily swap callbacks for counting
-    const originalCallbacks = this.creationCallbacks;
-    (this as any).creationCallbacks = countingCallbacks;
-
-    try {
-      // Use MCP tools - same pattern as task execution
-      for await (const message of query({
-        prompt,
-        options: {
-          systemPrompt: 'You are Deputy\'s autonomous planning assistant. Use the available tools to create goals, responsibilities, tasks, and store knowledge based on what needs attention. Be proactive but thoughtful.',
-          cwd: this.cwd,
-          model: this.model,
-          mcpServers: {
-            "deputy-tools": this.mcpServerFactory()
-          },
-          allowedTools: [
-            'mcp__deputy-tools__*', // Allow all deputy tools
-          ],
-        },
-      })) {
-        // Tools are invoked automatically
-        // Just consume the messages
-      }
-    } finally {
-      // Restore original callbacks
-      (this as any).creationCallbacks = originalCallbacks;
-    }
-
-    return { tasksCreated, goalsCreated, responsibilitiesCreated, contextStored };
-  }
-
-  /**
-   * Force a scan regardless of interval
-   */
-  async forceScan(): Promise<ScanResult> {
+  forceScan(): void {
     this.lastScanAt = null;
-    return this.scan();
   }
 
   /**

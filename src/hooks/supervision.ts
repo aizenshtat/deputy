@@ -19,18 +19,17 @@ export interface SupervisionConfig {
 const DEFAULT_CONFIG: SupervisionConfig = {
   requireApprovalFor: {
     externalCommunication: true,
-    fileModification: false,
+    fileModification: false,  // No Write/Edit tools anymore
     webActions: false,
-    bashCommands: true,
+    bashCommands: false,  // No Bash tool anymore
   },
   autoApprovePatterns: [
-    'Read',
-    'Glob',
-    'Grep',
     'WebSearch',
     'WebFetch',
+    // Note: Read/Glob/Grep/Bash removed - agents work in browser only
   ],
   blockPatterns: [
+    // Legacy patterns - agents don't have Bash access anymore
     'rm -rf',
     'sudo',
     'chmod 777',
@@ -70,54 +69,63 @@ export class SupervisionHook {
     if (toolName.includes('chrome-devtools') || toolName.includes('browser')) {
       const input = toolInput as any;
 
-      // Typing in message/email fields
+      // CRITICAL: ANY typing in messaging platforms requires approval
       if (toolName.includes('type') && input?.text) {
-        // Check if typing in messaging/email context (high risk if lengthy message)
-        if (input.text.length > 100) {
-          return { needed: true, reason: 'Composing message - requires approval before sending', risk: 'high' };
+        // Check if we're in a messaging context by looking at snapshot or element
+        const ref = input?.ref || '';
+        const element = input?.element?.toLowerCase() || '';
+        const text = input.text || '';
+
+        // Slack, Gmail, or any messaging - ALWAYS require approval for typing messages
+        if (element.includes('message') ||
+            element.includes('compose') ||
+            element.includes('chat') ||
+            element.includes('dm') ||
+            element.includes('slack') ||
+            element.includes('mail') ||
+            element.includes('email') ||
+            ref.includes('message') ||
+            ref.includes('compose') ||
+            text.length > 50) {  // Any substantial typing
+          return { needed: true, reason: 'Typing message in communication platform - requires approval', risk: 'high' };
         }
       }
 
-      // Clicking send/submit buttons
+      // CRITICAL: ANY clicking in messaging platforms requires approval
       if (toolName.includes('click')) {
         const element = input?.element?.toLowerCase() || '';
-        if (element.includes('send') || element.includes('submit') || element.includes('post')) {
-          return { needed: true, reason: 'Sending message/email - requires explicit approval', risk: 'high' };
+        const ref = input?.ref || '';
+
+        // Send/submit/post buttons - ALWAYS require approval
+        if (element.includes('send') ||
+            element.includes('submit') ||
+            element.includes('post') ||
+            element.includes('share') ||
+            ref.includes('send') ||
+            ref.includes('submit')) {
+          return { needed: true, reason: 'Clicking send/submit button - requires explicit approval', risk: 'high' };
+        }
+
+        // Any button/link in Slack messages - require approval
+        if (element.includes('slack') ||
+            element.includes('message') ||
+            element.includes('chat') ||
+            ref.includes('slack')) {
+          return { needed: true, reason: 'Interaction in Slack - requires approval', risk: 'high' };
         }
       }
 
-      // Navigation to messaging platforms
+      // Navigation to messaging platforms is safe
       if (toolName.includes('navigate') && input?.url) {
-        const url = input.url.toLowerCase();
-        if (url.includes('slack.com') || url.includes('mail.') || url.includes('gmail')) {
-          // Just navigation is safe, but flag for monitoring
-          return { needed: false, risk: 'low' };
-        }
+        return { needed: false, risk: 'low' };
       }
 
-      // Browser actions are generally safe unless they're communication
-      if (this.config.requireApprovalFor.webActions) {
-        return { needed: true, reason: 'Web action requires approval', risk: 'low' };
-      }
+      // All other browser actions are safe (reading pages, scrolling, etc.)
+      return { needed: false, risk: 'low' };
     }
 
-    // Check block patterns for Bash
-    if (toolName === 'Bash') {
-      const command = (toolInput as { command?: string })?.command ?? '';
-      for (const pattern of this.config.blockPatterns) {
-        if (command.includes(pattern)) {
-          return { needed: true, reason: `Command contains blocked pattern: ${pattern}`, risk: 'high' };
-        }
-      }
-      if (this.config.requireApprovalFor.bashCommands) {
-        return { needed: true, reason: 'Bash command requires approval', risk: 'medium' };
-      }
-    }
-
-    // File modifications
-    if ((toolName === 'Write' || toolName === 'Edit') && this.config.requireApprovalFor.fileModification) {
-      return { needed: true, reason: 'File modification requires approval', risk: 'medium' };
-    }
+    // Note: Bash/Write/Edit tools removed - agent works in browser only
+    // No filesystem or command checks needed
 
     return { needed: false, risk: 'low' };
   }

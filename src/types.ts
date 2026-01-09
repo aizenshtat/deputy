@@ -62,6 +62,7 @@ export interface ApprovalRequest {
   createdAt: Date;
   respondedAt?: Date;
   response?: string;
+  rejectionReason?: string;
   notes?: string;
 }
 

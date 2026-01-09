@@ -73,9 +73,21 @@ export class ApprovalQueue {
     approval.status = 'rejected';
     approval.respondedAt = new Date();
     approval.response = reason;
+    approval.rejectionReason = reason;
 
     this.notifyChange();
     return approval;
+  }
+
+  /**
+   * Delete an approval (after processing)
+   */
+  deleteApproval(approvalId: string): boolean {
+    const deleted = this.approvals.delete(approvalId);
+    if (deleted) {
+      this.notifyChange();
+    }
+    return deleted;
   }
 
   /**
