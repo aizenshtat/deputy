@@ -599,7 +599,7 @@ Be selective. Quality over quantity. If unsure, ask. If clear, act.`,
           mcpServers: {
             "playwright": {
               command: "npx",
-              args: ["-y", "@playwright/mcp@latest"]
+              args: ["-y", "@playwright/mcp@latest", "--cdp-endpoint", "http://127.0.0.1:9222"]
             },
             "deputy-tools": this.createDeputyTools()
           },
@@ -843,7 +843,7 @@ Be selective. Quality over quantity. If unsure, ask. If clear, act.`,
         mcpServers: {
           "playwright": {
             command: "npx",
-            args: ["-y", "@playwright/mcp@latest"]
+            args: ["-y", "@playwright/mcp@latest", "--cdp-endpoint", "http://127.0.0.1:9222"]
           },
           "deputy-tools": this.createDeputyTools()
         },

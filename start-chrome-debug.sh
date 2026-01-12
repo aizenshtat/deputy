@@ -1,12 +1,12 @@
 #!/bin/bash
-# Start Chrome with remote debugging for Deputy agent
-# This browser window will stay open and Deputy will connect to it
+# Start Chrome with remote debugging for Deputy + Playwright MCP
+# Playwright MCP connects via CDP to this Chrome instance, preserving your login sessions
 
 echo "🌐 Starting Chrome with remote debugging on port 9222..."
 echo "📁 Using profile: ~/.chrome-deputy-profile"
 echo ""
-echo "This Chrome window will stay open even when Deputy is idle."
-echo "Your logins and sessions will persist in this profile."
+echo "This Chrome keeps your login sessions (Gmail, Slack, etc.)"
+echo "Deputy connects via Playwright MCP using --cdp-endpoint"
 echo ""
 
 /Applications/Google\ Chrome.app/Contents/MacOS/Google\ Chrome \
@@ -15,5 +15,16 @@ echo ""
   --no-first-run \
   --no-default-browser-check &
 
-echo "✅ Chrome started! Deputy can now connect to it."
-echo "💡 To stop: Close the Chrome window or run: pkill -f 'remote-debugging-port=9222'"
+sleep 2
+
+# Verify Chrome is accessible
+if curl -s http://127.0.0.1:9222/json/version > /dev/null 2>&1; then
+  echo "✅ Chrome started and CDP endpoint ready!"
+  echo "💡 Deputy will connect via: http://127.0.0.1:9222"
+else
+  echo "⚠️  Chrome started but CDP endpoint not responding yet"
+  echo "   Wait a moment and verify with: curl http://127.0.0.1:9222/json/version"
+fi
+
+echo ""
+echo "💡 To stop: Close Chrome window or run: pkill -f 'remote-debugging-port=9222'"
