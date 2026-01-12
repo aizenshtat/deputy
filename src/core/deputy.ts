@@ -597,17 +597,17 @@ Be selective. Quality over quantity. If unsure, ask. If clear, act.`,
           cwd: this.config.workingDirectory,
           model: this.config.model,
           mcpServers: {
-            "chrome-devtools": {
+            "playwright": {
               command: "npx",
-              args: ["-y", "chrome-devtools-mcp@latest", "--browser-url=http://127.0.0.1:9222"]
+              args: ["-y", "@playwright/mcp@latest"]
             },
             "deputy-tools": this.createDeputyTools()
           },
           allowedTools: [
             // Web research and delegation
             'WebFetch', 'WebSearch', 'Task',
-            // Browser automation (Google Docs/Sheets/Slack/Gmail/etc.)
-            'mcp__chrome-devtools__*', // Wildcard: allow all chrome-devtools MCP tools
+            // Browser automation via Playwright MCP (supports canvas-based apps like Google Docs)
+            'mcp__playwright__*', // Wildcard: allow all Playwright MCP tools
             // Deputy custom tools (goals, tasks, approvals, context, responsibilities)
             'mcp__deputy-tools__*', // Wildcard: allow all deputy learning tools
             // NOTE: All filesystem tools removed (Read/Write/Edit/Grep/Glob/Bash) - executive assistant works in browser only
@@ -841,15 +841,15 @@ Be selective. Quality over quantity. If unsure, ask. If clear, act.`,
         cwd: this.config.workingDirectory,
         model: this.config.model,
         mcpServers: {
-          "chrome-devtools": {
+          "playwright": {
             command: "npx",
-            args: ["-y", "chrome-devtools-mcp@latest", "--browser-url=http://127.0.0.1:9222"]
+            args: ["-y", "@playwright/mcp@latest"]
           },
           "deputy-tools": this.createDeputyTools()
         },
         allowedTools: [
           'Read', 'Glob', 'Grep', 'WebFetch', 'WebSearch',
-          'mcp__chrome-devtools__*', // Wildcard: allow all chrome-devtools MCP tools
+          'mcp__playwright__*', // Wildcard: allow all Playwright MCP tools
           'mcp__deputy-tools__*',    // Wildcard: allow all deputy custom tools
         ],
         resume: this.currentSessionId,

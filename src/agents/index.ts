@@ -27,7 +27,7 @@ When executing tasks:
 4. Provide clear status summaries
 
 Communication style: Concise, action-oriented, data-driven.`,
-    tools: ['WebFetch', 'WebSearch', 'mcp__chrome-devtools__*'],
+    tools: ['WebFetch', 'WebSearch', 'mcp__playwright__*'],
     specializations: ['project tracking', 'milestone management', 'status reports', 'coordination'],
   },
 
@@ -50,7 +50,7 @@ When executing tasks:
 4. Flag final hiring decisions for approval
 
 Communication style: Professional, thorough, people-focused.`,
-    tools: ['WebFetch', 'WebSearch', 'mcp__chrome-devtools__*'],
+    tools: ['WebFetch', 'WebSearch', 'mcp__playwright__*'],
     specializations: ['job descriptions', 'candidate research', 'interview prep', 'hiring process'],
   },
 
@@ -72,7 +72,7 @@ When executing tasks:
 4. Structure agendas clearly
 
 Communication style: Executive-level, concise, well-structured.`,
-    tools: ['WebFetch', 'WebSearch', 'mcp__chrome-devtools__*'],
+    tools: ['WebFetch', 'WebSearch', 'mcp__playwright__*'],
     specializations: ['agendas', 'briefings', 'talking points', 'follow-ups'],
   },
 
@@ -95,7 +95,7 @@ When executing tasks:
 4. Cite sources and confidence levels
 
 Communication style: Analytical, thorough, evidence-based.`,
-    tools: ['WebFetch', 'WebSearch', 'mcp__chrome-devtools__*'],
+    tools: ['WebFetch', 'WebSearch', 'mcp__playwright__*'],
     specializations: ['market research', 'competitive analysis', 'technology trends', 'due diligence'],
   },
 
@@ -119,7 +119,7 @@ When executing tasks:
 CRITICAL: All external communications require explicit approval via RequestApproval tool.
 
 Communication style: Adaptable, clear, professional.`,
-    tools: ['WebFetch', 'WebSearch', 'mcp__chrome-devtools__*'],
+    tools: ['WebFetch', 'WebSearch', 'mcp__playwright__*'],
     specializations: ['emails', 'memos', 'announcements', 'stakeholder communications'],
   },
 
@@ -142,7 +142,7 @@ When executing tasks:
 4. Highlight key takeaways and visualizations
 
 Communication style: Data-driven, precise, insightful.`,
-    tools: ['WebFetch', 'WebSearch', 'mcp__chrome-devtools__*'],
+    tools: ['WebFetch', 'WebSearch', 'mcp__playwright__*'],
     specializations: ['data analysis', 'reporting', 'insights', 'metrics'],
   },
 
@@ -166,7 +166,7 @@ When executing tasks:
 CRITICAL: Calendar invites require explicit approval via RequestApproval tool.
 
 Communication style: Efficient, detail-oriented, accommodating.`,
-    tools: ['WebFetch', 'WebSearch', 'mcp__chrome-devtools__*'],
+    tools: ['WebFetch', 'WebSearch', 'mcp__playwright__*'],
     specializations: ['calendar', 'scheduling', 'meetings', 'availability', 'time zones'],
   },
 };
